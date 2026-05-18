@@ -1,0 +1,53 @@
+[
+  {
+    "id": "060-extension-ui-replay-agent-event-noop",
+    "file": "dist/core/extensions/runner.js",
+    "intent": "Expose a no-op ExtensionUIContext.replayAgentEvent in non-interactive modes so pi-sync can call one UI API regardless of mode.",
+    "find": "    getToolsExpanded: () => false,\n    setToolsExpanded: () => { },\n};",
+    "replace": "    getToolsExpanded: () => false,\n    setToolsExpanded: () => { },\n    replayAgentEvent: async () => { },\n};",
+    "verify": "replayAgentEvent: async () => { },",
+    "occurrences": 1,
+    "references": [
+      {
+        "type": "consumer-repo",
+        "repo": "pi-sync",
+        "paths": ["index.ts", "test/live-sync-widget.test.mjs"],
+        "reason": "pi-sync needs a native UI replay hook so attached Pi terminals can render the same event stream instead of approximating it in a widget."
+      }
+    ]
+  },
+  {
+    "id": "061-extension-ui-replay-agent-event-interactive",
+    "file": "dist/modes/interactive/interactive-mode.js",
+    "intent": "Expose ExtensionUIContext.replayAgentEvent in interactive mode by routing through InteractiveMode.handleEvent, and optionally through local extension handlers, giving synced terminals native Pi rendering plus extension-owned UI side effects for mirrored agent/session events.",
+    "find": "            getToolsExpanded: () => this.toolOutputExpanded,\n            setToolsExpanded: (expanded) => this.setToolsExpanded(expanded),\n        };",
+    "replace": "            getToolsExpanded: () => this.toolOutputExpanded,\n            setToolsExpanded: (expanded) => this.setToolsExpanded(expanded),\n            replayAgentEvent: async (event, options = {}) => {\n                if (options.emitExtensions) await this.session.extensionRunner.emit(event);\n                await this.handleEvent(event);\n            },\n        };",
+    "verify": "replayAgentEvent: async (event, options = {}) => {\n                if (options.emitExtensions) await this.session.extensionRunner.emit(event);\n                await this.handleEvent(event);\n            },",
+    "occurrences": 1,
+    "references": [
+      {
+        "type": "consumer-repo",
+        "repo": "pi-sync",
+        "paths": ["index.ts"],
+        "reason": "Allows remote same-session events to be consumed by Pi's normal interactive renderer and local UI extensions, making exact mirrored UI possible without ad hoc widgets."
+      }
+    ]
+  },
+  {
+    "id": "062-extension-ui-replay-agent-event-types",
+    "file": "dist/core/extensions/types.d.ts",
+    "intent": "Type the ExtensionUIContext.replayAgentEvent hook used by pi-sync. It accepts raw AgentSession event-shaped objects and replays them through the UI renderer when available, optionally emitting local extension handlers for extension-owned UI.",
+    "find": "    /** Set tool output expansion state. */\n    setToolsExpanded(expanded: boolean): void;\n}",
+    "replace": "    /** Set tool output expansion state. */\n    setToolsExpanded(expanded: boolean): void;\n    /** Replay an AgentSession event through the native UI renderer when available. */\n    replayAgentEvent(event: unknown, options?: { emitExtensions?: boolean }): Promise<void>;\n}",
+    "verify": "replayAgentEvent(event: unknown, options?: { emitExtensions?: boolean }): Promise<void>;",
+    "occurrences": 1,
+    "references": [
+      {
+        "type": "consumer-repo",
+        "repo": "pi-sync",
+        "paths": ["index.ts"],
+        "reason": "Provides TypeScript surface for the native UI replay hook and extension replay option."
+      }
+    ]
+  }
+]

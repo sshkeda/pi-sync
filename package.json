@@ -1,0 +1,29 @@
+{
+  "name": "pi-sync",
+  "version": "0.1.0",
+  "description": "Pi multi-attach live session synchronization layer.",
+  "type": "module",
+  "bin": {
+    "pi-sync-host": "./bin/pi-sync-host.js"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit --skipLibCheck --moduleResolution bundler --module esnext --target es2022 --types node index.ts",
+    "test": "for f in test/*.test.mjs; do echo RUN:$f; node --test \"$f\" || exit 1; sleep 1; done",
+    "bench:latency": "node scripts/benchmark-latency.mjs",
+    "record:side-by-side": "node scripts/record-side-by-side.mjs"
+  },
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "0.75.1"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.75.1",
+    "@types/node": "^25.6.0",
+    "typescript": "^6.0.3"
+  }
+}
