@@ -1,8 +1,6 @@
 # pi-sync
 
-Pi runtime/session synchronization layer.
-
-`pi-sync` is **not primarily a CLI**. The target behavior is native Pi multi-attach:
+Multi-terminal live session sharing for [Pi](https://github.com/earendil-works/pi-mono). Open the same Pi session in multiple terminal windows and they stay in sync — user input, streaming responses, tool calls, and status updates all mirror across attached terminals in real time. Late-joining terminals hydrate from session state.
 
 ```bash
 pi --session <session-id-or-path>
@@ -10,7 +8,7 @@ pi --session <session-id-or-path>
 pi --session <same-session-id-or-path>
 ```
 
-Both terminals should attach to the same live session/lane, update in sync, and render the same conversation/tool/status stream.
+Both terminals attach to the same live session/lane and render the same conversation/tool/status stream.
 
 ## Target invariant
 
