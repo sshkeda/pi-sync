@@ -6,9 +6,9 @@
 
 ## Roles
 
-- **session lane**: a `pi-lane` coordination scope keyed by session id/file.
+- **sync channel**: a `pi-sync` coordination scope keyed by session id/file.
 - **executor**: the process currently running the model/tool turn.
-- **attached view**: any terminal UI attached to the same session lane.
+- **attached view**: any terminal UI attached to the same session sync channel.
 - **event bus**: append/fanout stream of Pi UI/runtime events.
 
 ## Event model
@@ -34,12 +34,12 @@ The difference: pi-manager consumes one foreground stream; pi-sync broadcasts th
 ## Expected flow
 
 1. `pi --session X` starts.
-2. It joins storage at `~/.pi/lane/sessions/{sessionKey}/lanes/{lane}/sync`.
+2. It joins storage at `~/.pi/lane/sessions/{sessionKey}/lanes/{sync}/sync`.
 3. It hydrates normal Pi history from the session JSONL file.
-4. It subscribes to live lane events by tailing `events.jsonl`.
+4. It subscribes to live sync events by tailing `events.jsonl`.
 5. If user submits input and no executor is active, it claims the executor lease using `turn.lock/owner.json`.
-6. Executor emits canonical events to the lane.
-7. All attached views render those events through native replay or widget fallback.
+6. Executor emits canonical events to the sync channel.
+7. All attached views render those events through native replay.
 8. If a follower submits input while the executor lease is fresh, it writes `queued_input`; the active owner converts that into a follow-up user message.
 9. Late joiners replay from the current active turn's byte offset and then keep tailing live events.
 

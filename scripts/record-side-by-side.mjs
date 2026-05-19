@@ -1,6 +1,5 @@
 #!/usr/bin/env node
-import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -53,10 +52,6 @@ function makeRegularAgentDir(root, name, port) {
 
 async function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-function stableSessionKey(sessionFile) {
-  return createHash('sha256').update(sessionFile).digest('hex').slice(0, 24);
-}
-
 async function waitUntil(predicate, timeoutMs, label) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -64,6 +59,20 @@ async function waitUntil(predicate, timeoutMs, label) {
     await sleep(25);
   }
   throw new Error(`timeout waiting for ${label}`);
+}
+
+function findPromptQueuePath(dir) {
+  if (!existsSync(dir)) return undefined;
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      const found = findPromptQueuePath(path);
+      if (found) return found;
+    } else if (entry.isFile() && entry.name === 'prompt-queue.jsonl' && path.includes('/sync/')) {
+      return path;
+    }
+  }
+  return undefined;
 }
 
 async function main() {
@@ -198,11 +207,11 @@ async function main() {
     await capture('streaming chunk 1 visible on both', 2);
 
     b.submit('B submits while A is streaming; this should queue');
-    const syncDir = join(laneRoot, 'sessions', stableSessionKey(sessionFile), 'lanes', 'main', 'sync');
-    const promptQueuePath = join(syncDir, 'prompt-queue.jsonl');
     await waitUntil(
-      () => existsSync(promptQueuePath)
-        && readFileSync(promptQueuePath, 'utf8').includes('B submits while A is streaming'),
+      () => {
+        const promptQueuePath = findPromptQueuePath(laneRoot);
+        return !!promptQueuePath && readFileSync(promptQueuePath, 'utf8').includes('B submits while A is streaming');
+      },
       TIMEOUT,
       'host prompt queue entry',
     );

@@ -1,5 +1,32 @@
 [
   {
+    "id": "050-refresh-agent-state-after-input-hooks",
+    "file": "dist/core/agent-session.js",
+    "intent": "After input extension handlers run, rebuild agent.state.messages from the session manager before constructing the next prompt. This lets pi-sync reopen/branch the session during input handling so the model request uses the refreshed lane head without injecting hidden context.",
+    "find": "                if (inputResult.action === \"transform\") {\n                    currentText = inputResult.text;\n                    currentImages = inputResult.images ?? currentImages;\n                }\n            }\n            // Expand skill commands (/skill:name args) and prompt templates (/template args)",
+    "replace": "                if (inputResult.action === \"transform\") {\n                    currentText = inputResult.text;\n                    currentImages = inputResult.images ?? currentImages;\n                }\n                // Refresh agent transcript in case input hooks changed the active session leaf.\n                this.agent.state.messages = this.sessionManager.buildSessionContext().messages;\n            }\n            // Expand skill commands (/skill:name args) and prompt templates (/template args)",
+    "verify": "// Refresh agent transcript in case input hooks changed the active session leaf.",
+    "occurrences": 1,
+    "references": [
+      {
+        "type": "upstream-package",
+        "repo": "earendil-works/pi-mono",
+        "package": "@earendil-works/pi-coding-agent",
+        "versionConsidered": "0.74.0"
+      },
+      {
+        "type": "consumer-repo",
+        "repo": "pi-sync",
+        "paths": [
+          "index.ts",
+          "test/native-live-sync.test.mjs",
+          "test/turn-lease.test.mjs"
+        ],
+        "reason": "pi-sync input hooks refresh/branch session state to the lane head before forwarding prompts to the host; Pi must rebuild agent state before prompt construction so the model sees normal session history without hidden lane metadata."
+      }
+    ]
+  },
+  {
     "id": "060-extension-ui-replay-agent-event-noop",
     "file": "dist/core/extensions/runner.js",
     "intent": "Expose a no-op ExtensionUIContext.replayAgentEvent in non-interactive modes so pi-sync can call one UI API regardless of mode.",

@@ -4,11 +4,18 @@
   "description": "Pi multi-attach live session synchronization layer.",
   "type": "module",
   "bin": {
-    "pi-sync-host": "./bin/pi-sync-host.js"
+    "pi-sync-host": "./bin/pi-sync-host.js",
+    "pi-sync": "./bin/pisync.js",
+    "pisync": "./bin/pisync.js",
+    "pil": "./bin/pil.js"
+  },
+  "exports": {
+    ".": "./index.ts",
+    "./runtime": "./src/runtime.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit --skipLibCheck --moduleResolution bundler --module esnext --target es2022 --types node index.ts",
-    "test": "for f in test/*.test.mjs; do echo RUN:$f; node --test \"$f\" || exit 1; sleep 1; done",
+    "typecheck": "tsc --noEmit --skipLibCheck --allowImportingTsExtensions --moduleResolution bundler --module esnext --target es2022 --types node index.ts src/runtime.ts src/lane-state.ts",
+    "test": "bash scripts/run-tests.sh",
     "bench:latency": "node scripts/benchmark-latency.mjs",
     "record:side-by-side": "node scripts/record-side-by-side.mjs"
   },
@@ -16,6 +23,9 @@
   "pi": {
     "extensions": [
       "./index.ts"
+    ],
+    "skills": [
+      "./skills"
     ]
   },
   "peerDependencies": {

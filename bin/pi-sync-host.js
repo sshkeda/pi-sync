@@ -13,7 +13,7 @@ for (let i = 2; i < process.argv.length; i++) {
 
 const requestedSessionFile = args.get('session-file');
 if (!requestedSessionFile) {
-  console.error('usage: pi-sync-host --session-file <path> [--lane main] [--session-key key]');
+  console.error('usage: pi-sync-host --session-file <path> [--sync main] [--lane main] [--session-key key]');
   process.exit(2);
 }
 
@@ -27,10 +27,10 @@ function canonicalSessionFile(path) {
 }
 
 const instanceId = randomUUID();
-const lane = args.get('lane') || process.env.PI_LANE_CURRENT_LANE || 'main';
+const lane = args.get('sync') || args.get('lane') || process.env.PI_SYNC_CHANNEL || process.env.PI_LANE_CURRENT_LANE || 'main';
 const sessionFile = canonicalSessionFile(requestedSessionFile);
 const sessionKey = args.get('session-key') || createHash('sha256').update(sessionFile).digest('hex').slice(0, 24);
-const laneRoot = process.env.PI_LANE_ROOT || join(homedir(), '.pi', 'lane');
+const laneRoot = process.env.PI_SYNC_ROOT || process.env.PI_LANE_ROOT || join(homedir(), '.pi', 'lane');
 const sessionRoot = join(laneRoot, 'sessions', sessionKey, 'lanes', lane.replace(/[^a-zA-Z0-9_.=-]+/g, '_').slice(0, 96) || 'main', 'sync');
 const hostPath = join(sessionRoot, 'host.json');
 const socketKey = createHash('sha256').update(`${sessionRoot}:${process.env.USER ?? 'user'}`).digest('hex').slice(0, 24);
@@ -192,9 +192,75 @@ function sessionFileHasEntry(entryId) {
   }
 }
 
+function sessionFileEntryCount() {
+  try {
+    return readFileSync(sessionFile, 'utf8')
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => {
+        try { return JSON.parse(line); } catch { return undefined; }
+      })
+      .filter((entry) => entry && entry.type !== 'session').length;
+  } catch {
+    return 0;
+  }
+}
+
+function messagePersistenceKey(message) {
+  if (!message || typeof message !== 'object') return undefined;
+  const role = typeof message.role === 'string' ? message.role : undefined;
+  if (!['user', 'assistant', 'toolResult'].includes(role)) return undefined;
+  try {
+    return `${role}\0${JSON.stringify(message.content ?? null)}\0${message.toolCallId ?? ''}`;
+  } catch {
+    return `${role}\0${String(message.content ?? '')}\0${message.toolCallId ?? ''}`;
+  }
+}
+
+function persistedMessageCounts() {
+  const counts = new Map();
+  for (const entry of hostSessionManager?.getEntries?.() ?? []) {
+    if (entry?.type !== 'message') continue;
+    const key = messagePersistenceKey(entry.message);
+    if (key) counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  return counts;
+}
+
+function reconcileAgentTranscript(reason) {
+  if (!agentSession || !hostSessionManager?.appendMessage) return 0;
+  const messages = Array.isArray(agentSession.agent?.state?.messages) ? agentSession.agent.state.messages : [];
+  const persisted = persistedMessageCounts();
+  const seen = new Map();
+  let appended = 0;
+  for (const message of messages) {
+    const key = messagePersistenceKey(message);
+    if (!key) continue;
+    const needed = (seen.get(key) ?? 0) + 1;
+    seen.set(key, needed);
+    if ((persisted.get(key) ?? 0) >= needed) continue;
+    hostSessionManager.appendMessage(message);
+    persisted.set(key, (persisted.get(key) ?? 0) + 1);
+    appended++;
+  }
+  if (appended > 0) hostEvent('session_reconciled', { reason, appended, entries: hostSessionManager?.getEntries?.().length ?? null });
+  return appended;
+}
+
 function flushHostSessionFile(reason) {
   const rewriteFile = hostSessionManager?._rewriteFile;
   if (typeof rewriteFile !== 'function') return false;
+  const memoryEntryCount = hostSessionManager?.getEntries?.().length ?? 0;
+  const diskEntryCount = sessionFileEntryCount();
+  if (memoryEntryCount < diskEntryCount) {
+    hostEvent('session_flush_skipped_stale_manager', {
+      reason,
+      memoryEntryCount,
+      diskEntryCount,
+      leafEntryId: hostSessionManager?.getLeafId?.() ?? null,
+    });
+    return false;
+  }
   try {
     rewriteFile.call(hostSessionManager);
     hostEvent('session_flushed', {
@@ -220,6 +286,20 @@ function ensureHostLeafPersisted(reason) {
   const persisted = sessionFileHasEntry(leafEntryId);
   if (!persisted) hostEvent('session_flush_missing_leaf', { reason, leafEntryId });
   return persisted;
+}
+
+async function waitForAgentEventsDrained(reason) {
+  const queue = agentSession?._agentEventQueue;
+  if (!queue || typeof queue.then !== 'function') return;
+  try {
+    await queue;
+  } catch (error) {
+    hostEvent('agent_event_queue_error', {
+      reason,
+      message: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+  }
 }
 
 function sanitizeLaneName(value) {
@@ -431,7 +511,6 @@ async function initAgent() {
     });
     agentSession = created.session;
     agentSession.subscribe((agentEvent) => {
-      if (agentEvent?.type === 'message_end') flushHostSessionFile('message_end');
       hostEvent('agent_event', {
         agentEvent,
         promptId: activePrompt?.id ?? null,
@@ -441,6 +520,7 @@ async function initAgent() {
     });
     agentReady = true;
     hostEvent('agent_ready', { sessionId: agentSession.sessionId, sessionFile: agentSession.sessionFile });
+    setImmediate(() => { void pumpQueue(); }).unref?.();
   } catch (error) {
     hostEvent('agent_init_error', { message: error instanceof Error ? error.message : String(error), stack: error instanceof Error ? error.stack : undefined });
     throw error;
@@ -517,15 +597,21 @@ async function abortActive(payload = {}) {
 async function pumpQueue() {
   if (activePrompt || pendingPrompts.length === 0) return;
   await initAgent();
+  if (activePrompt || pendingPrompts.length === 0) return;
   if (!agentSession) return;
   const prompt = pendingPrompts.shift();
   activePrompt = prompt;
+  hostEvent('prompt_dequeued', { promptId: prompt.id, pendingPrompts: pendingPrompts.length });
   const laneHeadEntryId = moveHostToLaneHead(prompt);
   try {
+    hostEvent('model_sync_start', { promptId: prompt.id, modelProvider: prompt.modelProvider ?? null, modelId: prompt.modelId ?? null });
     await ensurePromptModel(prompt);
+    hostEvent('model_sync_end', { promptId: prompt.id, modelProvider: agentSession.model?.provider ?? null, modelId: agentSession.model?.id ?? null });
     hostEvent('prompt_start', { promptId: prompt.id, lane: promptLaneName(prompt), laneHeadEntryId, laneHeadSource: prompt.effectiveLaneHeadSource ?? null, modelProvider: agentSession.model?.provider ?? null, modelId: agentSession.model?.id ?? null, text: prompt.text ?? '' });
     writeHostInfo();
     await agentSession.prompt(prompt.text ?? '', { source: 'extension' });
+    await waitForAgentEventsDrained('prompt_complete');
+    reconcileAgentTranscript('prompt_complete');
     flushHostSessionFile('prompt_complete');
     updateLaneHeadAfterPrompt(prompt);
     hostEvent('prompt_end', { promptId: prompt.id });
@@ -574,7 +660,11 @@ const server = createServer((socket) => {
     clients.delete(socket);
     writeHostInfo();
     hostEvent('client_detach', { clients: clients.size });
-    scheduleIdleShutdown();
+    if (clients.size === 0 && (activePrompt || pendingPrompts.length > 0)) {
+      void abortActive({ source: 'last_client_detach', clientId: null });
+    } else {
+      scheduleIdleShutdown();
+    }
   });
 });
 

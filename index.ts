@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { connect, type Socket } from "node:net";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -7,15 +7,39 @@ import {
   mkdirSync,
   realpathSync,
   readFileSync,
+  readdirSync,
   renameSync,
   rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Key, matchesKey } from "@earendil-works/pi-tui";
+import {
+  DEFAULT_LANE,
+  type InstanceState,
+  type LaneState,
+  appendDebug,
+  ensureLane,
+  hostSocketPathForSyncDir,
+  instancePath,
+  laneInstancesDir,
+  laneLanesDir,
+  laneRoot,
+  laneSegment,
+  laneSessionDir,
+  laneStatePath,
+  nowIso,
+  readLane,
+  readJsonFile,
+  sanitizeLaneName,
+  syncDir,
+  updateLaneState,
+  writeJsonFile,
+  debugLogPath,
+} from "./src/lane-state.ts";
 
 type SessionManagerLike = {
   getSessionFile?: () => string | undefined;
@@ -50,6 +74,7 @@ type HostInfo = {
   lane: string;
   socketPath: string;
   heartbeatAt: string;
+  clients?: number;
   activePromptId?: string | null;
   pendingPrompts?: number;
 };
@@ -84,17 +109,30 @@ const MAX_PAYLOAD_CHARS = Number(process.env.PI_SYNC_MAX_PAYLOAD_CHARS ?? 20_000
 const EXACT_MODE = process.env.PI_SYNC_EXACT !== "0";
 const MAX_SEEN_EVENT_IDS = Number(process.env.PI_SYNC_MAX_SEEN_EVENT_IDS ?? 5_000);
 const HOST_RECONNECT_MS = Math.max(10, Number(process.env.PI_SYNC_HOST_RECONNECT_MS ?? 25));
+const COLD_PROMPT_GRACE_MS = Math.max(0, Number(process.env.PI_SYNC_COLD_PROMPT_GRACE_MS ?? 40));
 
-function nowIso(): string {
-  return new Date().toISOString();
+function isEscapeInput(data: string): boolean {
+  return data === "\x1b" || matchesKey(data, Key.escape) || matchesKey(data, Key.esc);
 }
 
 function stableSessionKey(sessionFile: string): string {
   return createHash("sha256").update(sessionFile).digest("hex").slice(0, 24);
 }
 
-function laneRoot(): string {
-  return process.env.PI_LANE_ROOT ?? join(homedir(), ".pi", "lane");
+function sameSessionFile(left: string | undefined, right: string | undefined): boolean {
+  if (!left || !right) return false;
+  try {
+    return realpathSync(left) === realpathSync(right);
+  } catch {
+    return left === right;
+  }
+}
+
+function activeSessionKeyFor(_ctx: ExtensionContext, file: string, _previousFile?: string, _previousKey?: string): string {
+  const envLaneSessionKey = process.env.PI_SYNC_SESSION_KEY ?? process.env.PI_LANE_SESSION_KEY;
+  const laneSessionFile = process.env.PI_SYNC_SESSION_FILE ?? process.env.PI_LANE_SESSION_FILE;
+  if (envLaneSessionKey && (!laneSessionFile || sameSessionFile(laneSessionFile, file))) return envLaneSessionKey;
+  return stableSessionKey(file);
 }
 
 function sessionManager(ctx: ExtensionContext): SessionManagerLike | undefined {
@@ -137,24 +175,10 @@ function refreshSessionFile(ctx: ExtensionContext): void {
   }
 }
 
+let moduleCurrentLane = DEFAULT_LANE;
+
 function currentLane(): string {
-  return process.env.PI_LANE_CURRENT_LANE || "main";
-}
-
-function laneSegment(lane: string = currentLane()): string {
-  return lane.replace(/[^a-zA-Z0-9_.=-]+/g, "_").slice(0, 96) || "main";
-}
-
-function laneStateSegment(lane: string = currentLane()): string {
-  return lane.replace(/[^a-zA-Z0-9._-]/g, "-").replace(/-+/g, "-").slice(0, 64) || "main";
-}
-
-function laneStatePath(sessionKey: string, lane: string = currentLane()): string {
-  return join(laneRoot(), "sessions", sessionKey, "lanes", `${laneStateSegment(lane)}.json`);
-}
-
-function syncDir(sessionKey: string, lane: string = currentLane()): string {
-  return join(laneRoot(), "sessions", sessionKey, "lanes", laneSegment(lane), "sync");
+  return moduleCurrentLane || DEFAULT_LANE;
 }
 
 function eventLogPath(sessionKey: string, lane: string = currentLane()): string {
@@ -178,8 +202,7 @@ function hostLockDirPath(sessionKey: string, lane: string = currentLane()): stri
 }
 
 function hostSocketPath(sessionKey: string, lane: string = currentLane()): string {
-  const key = createHash("sha256").update(`${syncDir(sessionKey, lane)}:${process.env.USER ?? "user"}`).digest("hex").slice(0, 24);
-  return join(process.env.TMPDIR ?? "/tmp", `pi-sync-${key}.sock`);
+  return hostSocketPathForSyncDir(syncDir(sessionKey, lane));
 }
 
 function hostEventsPath(sessionKey: string, lane: string = currentLane()): string {
@@ -343,6 +366,18 @@ function readHostInfo(sessionKey: string, lane: string = currentLane()): HostInf
   }
 }
 
+function processAlive(pid: number | undefined): boolean {
+  if (!Number.isInteger(pid) || (pid as number) <= 0) return false;
+  try {
+    process.kill(pid as number, 0);
+    const stat = execFileSync("ps", ["-p", String(pid), "-o", "stat="], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    if (stat.startsWith("Z")) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function readLaneState(sessionKey: string, lane: string = currentLane()): { headEntryId?: string | null; headEpoch?: number } | undefined {
   const path = laneStatePath(sessionKey, lane);
   if (!existsSync(path)) return undefined;
@@ -360,8 +395,25 @@ function readLaneState(sessionKey: string, lane: string = currentLane()): { head
 
 function isHostFresh(info: HostInfo | undefined): info is HostInfo {
   if (!info || info.state !== "running") return false;
+  if (!processAlive(info.pid)) return false;
   const t = Date.parse(info.heartbeatAt);
   return Number.isFinite(t) && Date.now() - t <= Number(process.env.PI_SYNC_HOST_LEASE_MS ?? 5_000);
+}
+
+function isHostLockFresh(sessionKey: string, lane: string): boolean {
+  const lockDir = hostLockDirPath(sessionKey, lane);
+  const ownerPath = join(lockDir, "owner.json");
+  try {
+    const owner = JSON.parse(readFileSync(ownerPath, "utf8")) as { state?: string; pid?: number; heartbeatAt?: string; startedAt?: string };
+    const t = Date.parse(owner.heartbeatAt ?? owner.startedAt ?? "");
+    if (["starting", "running"].includes(owner.state ?? "") && Number.isFinite(t) && Date.now() - t <= Number(process.env.PI_SYNC_HOST_LEASE_MS ?? 5_000)) {
+      return processAlive(owner.pid);
+    }
+    if (Number.isInteger(owner.pid) && !processAlive(owner.pid)) return false;
+  } catch {
+    // Fall back to the lock directory age for very old/corrupt lock owners.
+  }
+  return isFreshPath(lockDir, Number(process.env.PI_SYNC_HOST_LEASE_MS ?? 5_000));
 }
 
 function isFreshPath(path: string, maxAgeMs: number): boolean {
@@ -394,7 +446,11 @@ export default function piSync(pi: ExtensionAPI) {
   let lastHostSpawnLane: string | undefined;
   let lastHostSpawnAt = 0;
   const pendingHostPrompts: HostPrompt[] = [];
-  let observedHostActiveWork = false;
+  let hostAbortGraceStartedAt = 0;
+  let hostAbortGraceUntil = 0;
+  let remoteTurnMaybeUnflushed = false;
+  let remoteWorkingStartedAtMs: number | undefined;
+  let remoteWorkingTimer: ReturnType<typeof setInterval> | undefined;
   let readOffset = 0;
   let localOwnsTurn = false;
   let ownedTurnSessionKey: string | undefined;
@@ -406,6 +462,10 @@ export default function piSync(pi: ExtensionAPI) {
   const pendingQueuedInputs: Array<{ text: string; images?: any[] }> = [];
   const seenEventIds: string[] = [];
   const seenHostEventIds: string[] = [];
+  const abortedHostPromptIds = new Set<string>();
+  const hostPromptIdsWithStreamingMessage = new Set<string>();
+  const renderedAbortPromptIds = new Set<string>();
+  let suppressAbortedHostMessageEndUntil = 0;
   const optimisticOwnUserTextCounts = new Map<string, number>();
   const mirroredPromptTextCounts = new Map<string, number>();
   const hostRenderedPromptTextCounts = new Map<string, number>();
@@ -414,6 +474,14 @@ export default function piSync(pi: ExtensionAPI) {
   let replayHistoryPersistedMessageKeys: Set<string> | undefined;
   let pendingHostAbort = false;
   let selectedTreeCursorEntryId: string | null | undefined;
+  let laneHeartbeatTimer: ReturnType<typeof setInterval> | undefined;
+  let currentStatus: InstanceState["status"] = "idle";
+  let currentSessionFile: string | undefined;
+  let currentSessionKey: string | undefined;
+  let currentSessionId: string | null | undefined;
+  const startedAt = nowIso();
+  const initialSyncRootEnv = process.env.PI_SYNC_ROOT;
+  const initialLaneRootEnv = process.env.PI_LANE_ROOT;
 
   function isReplayingRemoteAgentEvent(): boolean {
     return replayingRemoteAgentEvents > 0;
@@ -436,13 +504,284 @@ export default function piSync(pi: ExtensionAPI) {
     return extras.join(",");
   }
 
+  function formatRemoteWorkingDuration(ms: number): string {
+    const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    if (hours > 0) return `${hours}h ${minutes}m`;
+    if (minutes > 0) return `${minutes}m ${seconds}s`;
+    return `${seconds}s`;
+  }
+
+  function hostEventTimeMs(event: any): number {
+    const at = typeof event?.at === "string" ? Date.parse(event.at) : NaN;
+    return Number.isFinite(at) ? at : Date.now();
+  }
+
+  function applyRemoteWorking(ctx: ExtensionContext): void {
+    if (!EXACT_MODE || remoteWorkingStartedAtMs == null) return;
+    try {
+      const message = ctx.ui.theme?.fg
+        ? ctx.ui.theme.fg("dim", `Working for ${formatRemoteWorkingDuration(Date.now() - remoteWorkingStartedAtMs)}`)
+        : `Working for ${formatRemoteWorkingDuration(Date.now() - remoteWorkingStartedAtMs)}`;
+      ctx.ui.setWorkingMessage(message);
+      ctx.ui.setWorkingVisible(true);
+    } catch {
+      stopRemoteWorking();
+    }
+  }
+
+  function startRemoteWorking(ctx: ExtensionContext, startedAtMs: number): void {
+    if (!EXACT_MODE) return;
+    if (remoteWorkingStartedAtMs == null || startedAtMs < remoteWorkingStartedAtMs) {
+      remoteWorkingStartedAtMs = startedAtMs;
+    }
+    applyRemoteWorking(ctx);
+    if (!remoteWorkingTimer) {
+      remoteWorkingTimer = setInterval(() => applyRemoteWorking(ctx), 250);
+      remoteWorkingTimer.unref?.();
+    }
+  }
+
+  function stopRemoteWorking(): void {
+    if (remoteWorkingTimer) clearInterval(remoteWorkingTimer);
+    remoteWorkingTimer = undefined;
+    remoteWorkingStartedAtMs = undefined;
+  }
+
+  function exportLaneIdentity(ctx: ExtensionContext, file: string): LaneState | undefined {
+    const key = activeSessionKeyFor(ctx, file, activeSessionFile, activeSessionKey);
+    const id = sessionId(ctx);
+    currentSessionId = id;
+    currentSessionFile = file;
+    currentSessionKey = key;
+    process.env.PI_SYNC_INSTANCE_ID = instanceId;
+    process.env.PI_LANE_INSTANCE_ID = instanceId;
+    if (id) {
+      process.env.PI_SYNC_SESSION_ID = id;
+      process.env.PI_LANE_SESSION_ID = id;
+    } else {
+      delete process.env.PI_SYNC_SESSION_ID;
+      delete process.env.PI_LANE_SESSION_ID;
+    }
+    process.env.PI_SYNC_SESSION_KEY = key;
+    process.env.PI_SYNC_SESSION_FILE = file;
+    process.env.PI_SYNC_CHANNEL = currentLane();
+    process.env.PI_SYNC_ROOT = laneRoot();
+    process.env.PI_LANE_SESSION_KEY = key;
+    process.env.PI_LANE_SESSION_FILE = file;
+    process.env.PI_LANE_CURRENT_LANE = currentLane();
+    process.env.PI_LANE_ROOT = laneRoot();
+    const lane = ensureLane(key, file, currentLane(), sessionManager(ctx)?.getLeafId?.() ?? persistedLeafId(file) ?? null);
+    const displayId = activeLaneDisplayId(key, currentLane());
+    process.env.PI_SYNC_CHANNEL_ID = displayId;
+    process.env.PI_SYNC_CHANNEL_FILE_ID = lane.id ?? "";
+    process.env.PI_LANE_CURRENT_LANE_ID = displayId;
+    process.env.PI_LANE_CURRENT_LANE_FILE_ID = lane.id ?? "";
+    if (lane.aliasPath) {
+      process.env.PI_SYNC_CHANNEL_FILE = lane.aliasPath;
+      process.env.PI_LANE_CURRENT_LANE_FILE = lane.aliasPath;
+    } else {
+      delete process.env.PI_SYNC_CHANNEL_FILE;
+      delete process.env.PI_LANE_CURRENT_LANE_FILE;
+    }
+    return lane;
+  }
+
+  function clearLaneIdentity(): void {
+    delete process.env.PI_SYNC_INSTANCE_ID;
+    delete process.env.PI_SYNC_SESSION_ID;
+    delete process.env.PI_SYNC_SESSION_KEY;
+    delete process.env.PI_SYNC_SESSION_FILE;
+    delete process.env.PI_SYNC_CHANNEL;
+    delete process.env.PI_SYNC_CHANNEL_ID;
+    delete process.env.PI_SYNC_CHANNEL_FILE_ID;
+    delete process.env.PI_SYNC_CHANNEL_FILE;
+    delete process.env.PI_LANE_INSTANCE_ID;
+    delete process.env.PI_LANE_SESSION_ID;
+    delete process.env.PI_LANE_SESSION_KEY;
+    delete process.env.PI_LANE_SESSION_FILE;
+    delete process.env.PI_LANE_CURRENT_LANE;
+    delete process.env.PI_LANE_CURRENT_LANE_ID;
+    delete process.env.PI_LANE_CURRENT_LANE_FILE_ID;
+    delete process.env.PI_LANE_CURRENT_LANE_FILE;
+    if (initialSyncRootEnv === undefined) delete process.env.PI_SYNC_ROOT;
+    else process.env.PI_SYNC_ROOT = initialSyncRootEnv;
+    if (initialLaneRootEnv === undefined) delete process.env.PI_LANE_ROOT;
+    else process.env.PI_LANE_ROOT = initialLaneRootEnv;
+  }
+
+  function writeLaneInstance(ctx: ExtensionContext, file: string, status = currentStatus): void {
+    currentStatus = status;
+    const lane = exportLaneIdentity(ctx, file);
+    if (!lane || !currentSessionKey) return;
+    const state: InstanceState = {
+      instanceId,
+      pid: process.pid,
+      lane: currentLane(),
+      status,
+      sessionId: currentSessionId ?? null,
+      sessionKey: currentSessionKey,
+      sessionFile: file,
+      leafId: sessionManager(ctx)?.getLeafId?.() ?? null,
+      startedAt,
+      lastSeenAt: nowIso(),
+    };
+    writeJsonFile(instancePath(currentSessionKey, instanceId), state);
+  }
+
+  function readLaneInstances(sessionKey: string): InstanceState[] {
+    try {
+      mkdirSync(laneInstancesDir(sessionKey), { recursive: true });
+      return readdirSync(laneInstancesDir(sessionKey))
+        .filter((item) => item.endsWith(".json"))
+        .map((item) => readJsonFile<InstanceState>(join(laneInstancesDir(sessionKey), item)))
+        .filter((item): item is InstanceState => !!item);
+    } catch {
+      return [];
+    }
+  }
+
+  function isLiveLaneInstance(state: InstanceState): boolean {
+    if (state.status === "disconnected") return false;
+    const staleMs = Number(process.env.PI_SYNC_INSTANCE_STALE_MS ?? process.env.PI_LANE_INSTANCE_STALE_MS ?? 15_000);
+    const lastSeenAt = Date.parse(state.lastSeenAt);
+    return Number.isFinite(lastSeenAt) && Date.now() - lastSeenAt <= staleMs;
+  }
+
+  function activeLaneDisplayId(sessionKey: string, lane: string): string {
+    const name = sanitizeLaneName(lane);
+    if (name === DEFAULT_LANE) return "L1";
+    const activeLanes = new Set<string>([DEFAULT_LANE, name]);
+    for (const instance of readLaneInstances(sessionKey)) {
+      if (isLiveLaneInstance(instance)) activeLanes.add(sanitizeLaneName(instance.lane));
+    }
+    const nonMain = [...activeLanes].filter((item) => item !== DEFAULT_LANE).sort((a, b) => a.localeCompare(b));
+    return `L${nonMain.indexOf(name) + 2}`;
+  }
+
+  function readLaneStates(sessionKey: string): LaneState[] {
+    try {
+      mkdirSync(laneLanesDir(sessionKey), { recursive: true });
+      return readdirSync(laneLanesDir(sessionKey))
+        .filter((item) => item.endsWith(".json"))
+        .map((item) => readJsonFile<LaneState>(join(laneLanesDir(sessionKey), item)))
+        .filter((item): item is LaneState => !!item);
+    } catch {
+      return [];
+    }
+  }
+
+  function normalizeLaneSelector(value: string | undefined): string {
+    const raw = String(value ?? "").trim();
+    if (!raw) return DEFAULT_LANE;
+    if (/^\d+$/.test(raw)) return `L${raw}`;
+    return raw;
+  }
+
+  function resolveLaneName(sessionKey: string, selector: string | undefined): string | undefined {
+    const normalized = normalizeLaneSelector(selector);
+    const sanitized = sanitizeLaneName(normalized);
+    const lanes = readLaneStates(sessionKey);
+    const byName = lanes.find((lane) => sanitizeLaneName(lane.name) === sanitized);
+    if (byName) return byName.name;
+    const upper = normalized.toUpperCase();
+    const byDisplay = lanes.find((lane) => (lane.displayId ?? "").toUpperCase() === upper);
+    if (byDisplay) return byDisplay.name;
+    if (upper === "L1" || sanitized === DEFAULT_LANE) return DEFAULT_LANE;
+    return undefined;
+  }
+
+  function liveLaneInstances(sessionKey: string, lane?: string): InstanceState[] {
+    return readLaneInstances(sessionKey)
+      .filter((item) => isLiveLaneInstance(item))
+      .filter((item) => lane === undefined || sanitizeLaneName(item.lane) === sanitizeLaneName(lane));
+  }
+
+  function notifyLane(ctx: ExtensionContext, message: string): void {
+    ctx.ui?.notify?.(message, "info");
+  }
+
+  function initializeLaneSession(ctx: ExtensionContext): void {
+    const initialFile = sessionFile(ctx);
+    if (initialFile) sessionManager(ctx)?.setSessionFile?.(initialFile);
+    const file = sessionFile(ctx) ?? initialFile;
+    if (!file) {
+      clearLaneIdentity();
+      return;
+    }
+    moduleCurrentLane = DEFAULT_LANE;
+    const key = activeSessionKeyFor(ctx, file, activeSessionFile, activeSessionKey);
+    mkdirSync(laneLanesDir(key), { recursive: true });
+    mkdirSync(laneInstancesDir(key), { recursive: true });
+    ensureLane(key, file, DEFAULT_LANE, persistedLeafId(file) ?? null);
+    writeLaneInstance(ctx, file, "idle");
+    if (laneHeartbeatTimer) clearInterval(laneHeartbeatTimer);
+    laneHeartbeatTimer = setInterval(() => writeLaneInstance(ctx, file), Math.max(250, Number(process.env.PI_LANE_HEARTBEAT_MS ?? 2_000)));
+    laneHeartbeatTimer.unref?.();
+  }
+
+  function treeLaneNameForHead(headEntryId: string | null): string {
+    if (!headEntryId) return "tree-root";
+    return `tree-${createHash("sha256").update(headEntryId).digest("hex").slice(0, 12)}`;
+  }
+
+  function existingTreeLaneForHead(sessionKey: string, headEntryId: string | null): string | undefined {
+    try {
+      mkdirSync(laneLanesDir(sessionKey), { recursive: true });
+      for (const item of readdirSync(laneLanesDir(sessionKey))) {
+        if (!item.endsWith(".json")) continue;
+        const lane = readJsonFile<LaneState>(join(laneLanesDir(sessionKey), item));
+        if (!lane || lane.name === DEFAULT_LANE) continue;
+        if ((lane.baseLeafId ?? null) === headEntryId || (lane.headEntryId ?? null) === headEntryId) return lane.name;
+      }
+    } catch {
+      return undefined;
+    }
+    return undefined;
+  }
+
+  function laneNameForTreeSelection(sessionKey: string, file: string, headEntryId: string | null): string {
+    const main = ensureLane(sessionKey, file, DEFAULT_LANE, persistedLeafId(file) ?? null);
+    if ((main.headEntryId ?? null) === headEntryId) return DEFAULT_LANE;
+    return existingTreeLaneForHead(sessionKey, headEntryId) ?? treeLaneNameForHead(headEntryId);
+  }
+
+  function switchLaneForTreeSelection(ctx: ExtensionContext, file: string, newHeadEntryId: string | null, oldLeafId?: string | null): void {
+    const key = activeSessionKeyFor(ctx, file, activeSessionFile, activeSessionKey);
+    const lane = laneNameForTreeSelection(key, file, newHeadEntryId);
+    moduleCurrentLane = lane;
+    const current = ensureLane(key, file, lane, newHeadEntryId);
+    if ((current.headEntryId ?? null) !== newHeadEntryId || (current.baseLeafId ?? null) !== newHeadEntryId) {
+      updateLaneState(key, file, lane, {
+        baseLeafId: current.baseLeafId ?? newHeadEntryId,
+        headEntryId: newHeadEntryId,
+        headEpoch: (current.headEntryId ?? null) === newHeadEntryId ? current.headEpoch : current.headEpoch + 1,
+        updatedBy: instanceId,
+      });
+    }
+    appendDebug(key, "tree_navigation_lane_switch", {
+      lane,
+      oldLeafId: oldLeafId ?? null,
+      newHeadEntryId,
+      instanceId,
+    });
+    writeLaneInstance(ctx, file, "idle");
+  }
+
   function ensureHost(ctx: ExtensionContext): void {
     if (!ensureActivePaths(ctx) || !activeSessionKey || !activeSessionFile) return;
     const lane = activeLane ?? currentLane();
     const existing = readHostInfo(activeSessionKey, lane);
     if (isHostFresh(existing) && existsSync(hostSocketPath(activeSessionKey, lane))) return;
-    if (isFreshPath(hostLockDirPath(activeSessionKey, lane), Number(process.env.PI_SYNC_HOST_LEASE_MS ?? 5_000))) return;
-    if (lastHostSpawnSessionKey === activeSessionKey && lastHostSpawnLane === lane && Date.now() - lastHostSpawnAt <= Number(process.env.PI_SYNC_HOST_LEASE_MS ?? 5_000)) return;
+    const existingDead = !!existing?.pid && !isHostFresh(existing);
+    if (existingDead) {
+      try { rmSync(hostSocketPath(activeSessionKey, lane), { force: true }); } catch {}
+      try { rmSync(hostLockDirPath(activeSessionKey, lane), { recursive: true, force: true }); } catch {}
+    }
+    if (isHostLockFresh(activeSessionKey, lane)) return;
+    if (!existingDead && lastHostSpawnSessionKey === activeSessionKey && lastHostSpawnLane === lane && Date.now() - lastHostSpawnAt <= Number(process.env.PI_SYNC_HOST_LEASE_MS ?? 5_000)) return;
     lastHostSpawnSessionKey = activeSessionKey;
     lastHostSpawnLane = lane;
     lastHostSpawnAt = Date.now();
@@ -454,7 +793,7 @@ export default function piSync(pi: ExtensionAPI) {
     ], {
       detached: true,
       stdio: "ignore",
-      env: { ...process.env, PI_LANE_ROOT: laneRoot(), PI_LANE_CURRENT_LANE: lane, PI_SYNC_HOST_PROCESS: "1", PI_SYNC_HOST_EXTENSIONS: cliExtensionArgsForHost() },
+      env: { ...process.env, PI_SYNC_ROOT: laneRoot(), PI_LANE_ROOT: laneRoot(), PI_SYNC_CHANNEL: lane, PI_LANE_CURRENT_LANE: lane, PI_SYNC_HOST_PROCESS: "1", PI_SYNC_HOST_EXTENSIONS: cliExtensionArgsForHost() },
     });
     child.unref();
   }
@@ -469,16 +808,90 @@ export default function piSync(pi: ExtensionAPI) {
     hostReconnectTimer.unref?.();
   }
 
+  function abortedAssistantMessage(ctx: ExtensionContext): any {
+    return {
+      role: "assistant",
+      content: [],
+      api: (ctx.model as any)?.api ?? "pi-sync",
+      provider: (ctx.model as any)?.provider ?? "pi-sync",
+      model: (ctx.model as any)?.id ?? (ctx.model as any)?.model ?? "unknown",
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          total: 0,
+        },
+      },
+      stopReason: "aborted",
+      errorMessage: "Operation aborted",
+      timestamp: Date.now(),
+    };
+  }
+
+  function renderHostAbortRequested(ctx: ExtensionContext, rawPayload: unknown): void {
+    const payload = rawPayload && typeof rawPayload === "object" ? rawPayload as Record<string, any> : {};
+    const activePromptId = typeof payload.activePromptId === "string" ? payload.activePromptId : undefined;
+    const clearedPendingPrompts =
+      typeof payload.clearedPendingPrompts === "number"
+        ? payload.clearedPendingPrompts
+        : payload.clearedLocalPendingPrompts
+          ? 1
+          : 0;
+    if (activePromptId) abortedHostPromptIds.add(activePromptId);
+    if (!activePromptId && clearedPendingPrompts <= 0) return;
+
+    if (EXACT_MODE) ctx.ui.setWorkingVisible(false);
+    if (activePromptId && renderedAbortPromptIds.has(activePromptId)) return;
+    if (activePromptId) renderedAbortPromptIds.add(activePromptId);
+    suppressAbortedHostMessageEndUntil = Date.now() + 5_000;
+
+    const replayAgentEvent = nativeReplay(ctx);
+    const message = abortedAssistantMessage(ctx);
+    const hasStreamingMessage = hostPromptIdsWithStreamingMessage.has(activePromptId ?? "");
+    const events = hasStreamingMessage
+      ? [{ type: "message_end", message }]
+      : [
+        { type: "message_start", message: { ...message, stopReason: undefined, errorMessage: undefined } },
+        { type: "message_end", message },
+      ];
+    replayingRemoteAgentEvents++;
+    const previousReplayEnv = process.env.PI_SYNC_REPLAYING_REMOTE;
+    process.env.PI_SYNC_REPLAYING_REMOTE = "1";
+    void (async () => {
+      for (const replayEvent of events) {
+        await Promise.resolve(replayAgentEvent(replayEvent, { emitExtensions: true }));
+      }
+    })()
+      .catch(() => undefined)
+      .finally(() => {
+        replayingRemoteAgentEvents = Math.max(0, replayingRemoteAgentEvents - 1);
+        if (previousReplayEnv === undefined) delete process.env.PI_SYNC_REPLAYING_REMOTE;
+        else process.env.PI_SYNC_REPLAYING_REMOTE = previousReplayEnv;
+      });
+  }
+
   function replayHostEvent(event: any, ctx: ExtensionContext): void {
     if (!event) return;
     if (typeof event.id === "string" && !rememberHostEvent(event.id)) return;
-    if (event.type === "prompt_queued" || event.type === "prompt_start" || event.type === "abort_requested") {
-      observedHostActiveWork = true;
+    if (event.type === "prompt_queued" || event.type === "prompt_start") {
+      if (event.type === "prompt_queued" || event.type === "prompt_start") remoteTurnMaybeUnflushed = true;
+      if (event.type === "prompt_start") startRemoteWorking(ctx, hostEventTimeMs(event));
     } else if (event.type === "prompt_end" || event.type === "prompt_error") {
-      observedHostActiveWork = false;
+      hostAbortGraceStartedAt = 0;
+      hostAbortGraceUntil = 0;
+      suppressAbortedHostMessageEndUntil = 0;
+      stopRemoteWorking();
     }
     if (event.type === "session_flushed" || event.type === "lane_head_updated" || event.type === "prompt_end" || event.type === "prompt_error") {
       refreshSessionFile(ctx);
+      remoteTurnMaybeUnflushed = false;
       return;
     }
     if (event.type === "prompt_queued") {
@@ -495,19 +908,40 @@ export default function piSync(pi: ExtensionAPI) {
       return;
     }
     if (event.type === "abort_requested") {
+      renderHostAbortRequested(ctx, event.payload);
       return;
     }
     if (event.type !== "agent_event") return;
     const replayEvent = event.payload?.agentEvent;
+    const promptId = typeof event.payload?.promptId === "string" ? event.payload.promptId : undefined;
+    if (Date.now() < suppressAbortedHostMessageEndUntil && replayEvent?.message?.role === "assistant") {
+      return;
+    }
+    if (promptId && abortedHostPromptIds.has(promptId)) {
+      if (replayEvent?.type === "agent_end") {
+        hostPromptIdsWithStreamingMessage.delete(promptId);
+        renderedAbortPromptIds.delete(promptId);
+        abortedHostPromptIds.delete(promptId);
+        const replayAgentEvent = nativeReplay(ctx);
+        void Promise.resolve(replayAgentEvent(replayEvent, { emitExtensions: true })).catch(() => undefined);
+      }
+      return;
+    }
     if (replayEvent?.type === "turn_start" || replayEvent?.type === "turn_end") return;
     if (replayEvent?.type === "queue_update") return;
-    if (replayEvent?.type === "agent_start") observedHostActiveWork = true;
-    if (replayEvent?.type === "agent_end") observedHostActiveWork = false;
+    if (replayEvent?.type === "agent_end") {
+      hostAbortGraceStartedAt = 0;
+      hostAbortGraceUntil = 0;
+    }
+    if (replayEvent?.type === "message_end" || replayEvent?.type === "agent_end") remoteTurnMaybeUnflushed = true;
     if (isPersistedReplayMessageEvent(replayEvent)) return;
     if (isPersistedReplayAgentEnd(replayEvent)) return;
     if (isAlreadyEchoedUserPrompt(event, replayEvent)) return;
-    if (replayEvent?.type === "agent_start" && EXACT_MODE) ctx.ui.setWorkingVisible(false);
+    if (replayEvent?.type === "agent_start") startRemoteWorking(ctx, hostEventTimeMs(event));
     if (replayEvent) {
+      if (promptId && replayEvent.type === "message_start" && replayEvent.message?.role === "assistant") {
+        hostPromptIdsWithStreamingMessage.add(promptId);
+      }
       const replayAgentEvent = nativeReplay(ctx);
       replayingRemoteAgentEvents++;
       const previousReplayEnv = process.env.PI_SYNC_REPLAYING_REMOTE;
@@ -522,6 +956,10 @@ export default function piSync(pi: ExtensionAPI) {
       if (replayEvent.type === "message_start") {
         const text = messageText(replayEvent.message);
         if (text !== undefined) addHostRenderedPromptText(text);
+      }
+      if (promptId && (replayEvent.type === "message_end" || replayEvent.type === "agent_end")) {
+        hostPromptIdsWithStreamingMessage.delete(promptId);
+        renderedAbortPromptIds.delete(promptId);
       }
     }
   }
@@ -550,6 +988,7 @@ export default function piSync(pi: ExtensionAPI) {
 
   function handleHostMessage(message: any, ctx: ExtensionContext): void {
     if (message?.type !== "event") return;
+    if (message.event?.sessionKey !== activeSessionKey || message.event?.lane !== activeLane) return;
     replayHostEvent(message.event, ctx);
   }
 
@@ -557,9 +996,20 @@ export default function piSync(pi: ExtensionAPI) {
   function connectHost(ctx: ExtensionContext): void {
     if (shuttingDown) return;
     if (!ensureActivePaths(ctx) || !activeSessionKey) return;
-    if (hostSocket && !hostSocket.destroyed) return;
+    if (hostSocket && !hostSocket.destroyed) {
+      const host = readHostInfo(activeSessionKey, activeLane ?? currentLane());
+      if (isHostFresh(host)) return;
+      try { hostSocket.destroy(); } catch {}
+      hostSocket = undefined;
+      hostSocketBuffer = "";
+    }
     ensureHost(ctx);
     const socketPath = hostSocketPath(activeSessionKey, activeLane ?? currentLane());
+    const host = readHostInfo(activeSessionKey, activeLane ?? currentLane());
+    if (!isHostFresh(host)) {
+      scheduleHostReconnect(ctx);
+      return;
+    }
     if (!existsSync(socketPath)) {
       scheduleHostReconnect(ctx);
       return;
@@ -571,14 +1021,30 @@ export default function piSync(pi: ExtensionAPI) {
     socket.setNoDelay?.(true);
     socket.on("connect", () => {
       replayHostHistory(ctx);
-      while (pendingHostPrompts.length > 0 && !socket.destroyed) {
-        const prompt = pendingHostPrompts.shift();
-        if (prompt) socket.write(JSON.stringify({ type: "prompt", ...prompt, source: "pi-sync", clientId: instanceId }) + "\n");
-      }
       if (pendingHostAbort && !socket.destroyed) {
         pendingHostAbort = false;
+        pendingHostPrompts.length = 0;
         socket.write(JSON.stringify({ type: "abort", source: "pi-sync", clientId: instanceId }) + "\n");
         publish(ctx, "abort_requested", { source: "escape" });
+        return;
+      }
+      const flushPrompts = () => {
+        if (pendingHostAbort && !socket.destroyed) {
+          pendingHostAbort = false;
+          pendingHostPrompts.length = 0;
+          socket.write(JSON.stringify({ type: "abort", source: "pi-sync", clientId: instanceId }) + "\n");
+          publish(ctx, "abort_requested", { source: "escape" });
+          return;
+        }
+        while (pendingHostPrompts.length > 0 && !socket.destroyed) {
+          const prompt = pendingHostPrompts.shift();
+          if (prompt) socket.write(JSON.stringify({ type: "prompt", ...prompt, source: "pi-sync", clientId: instanceId }) + "\n");
+        }
+      };
+      if (COLD_PROMPT_GRACE_MS > 0 && pendingHostPrompts.length > 0) {
+        setTimeout(flushPrompts, COLD_PROMPT_GRACE_MS).unref?.();
+      } else {
+        flushPrompts();
       }
     });
     socket.on("data", (chunk) => {
@@ -588,6 +1054,7 @@ export default function piSync(pi: ExtensionAPI) {
         const line = hostSocketBuffer.slice(0, idx).trim();
         hostSocketBuffer = hostSocketBuffer.slice(idx + 1);
         if (!line) continue;
+        if (hostSocket !== socket) continue;
         try {
           handleHostMessage(JSON.parse(line), ctx);
         } catch {
@@ -604,7 +1071,8 @@ export default function piSync(pi: ExtensionAPI) {
 
   function sendHostPrompt(ctx: ExtensionContext, text: string): boolean {
     connectHost(ctx);
-    observedHostActiveWork = true;
+    hostAbortGraceStartedAt = Date.now();
+    hostAbortGraceUntil = hostAbortGraceStartedAt + 1000;
     const lane = activeLane ?? currentLane();
     const laneState = activeSessionKey ? readLaneState(activeSessionKey, lane) : undefined;
     const prompt: HostPrompt = {
@@ -637,21 +1105,52 @@ export default function piSync(pi: ExtensionAPI) {
   }
 
   function hostHasActiveWork(): boolean {
-    if (observedHostActiveWork || pendingHostPrompts.length > 0) return true;
+    if (pendingHostPrompts.length > 0) return true;
     if (!activeSessionKey) return false;
     const host = readHostInfo(activeSessionKey, activeLane ?? currentLane());
-    return !!(isHostFresh(host) && (host.activePromptId || (host.pendingPrompts ?? 0) > 0));
+    const now = Date.now();
+    if (!isHostFresh(host)) return now < hostAbortGraceUntil;
+    if (host.activePromptId || (host.pendingPrompts ?? 0) > 0) return true;
+    if (host.state === "running" && (host.clients ?? 0) > 0) return true;
+    const heartbeatAt = typeof host.heartbeatAt === "string" ? Date.parse(host.heartbeatAt) : NaN;
+    if (now < hostAbortGraceUntil && (!Number.isFinite(heartbeatAt) || heartbeatAt < hostAbortGraceStartedAt)) return true;
+    hostAbortGraceStartedAt = 0;
+    hostAbortGraceUntil = 0;
+    return false;
+  }
+
+  function abortLocalSession(ctx: ExtensionContext): void {
+    try {
+      void Promise.resolve(ctx.abort()).catch(() => undefined);
+    } catch {
+      // The host abort is authoritative; local abort only keeps the terminal session in sync.
+    }
   }
 
   function sendHostAbort(ctx: ExtensionContext): boolean {
+    if (pendingHostPrompts.length > 0) {
+      const clearedLocalPendingPrompts = pendingHostPrompts.length;
+      pendingHostPrompts.length = 0;
+      hostAbortGraceStartedAt = 0;
+      hostAbortGraceUntil = 0;
+      pendingHostAbort = false;
+      if (EXACT_MODE) ctx.ui.setWorkingVisible(false);
+      renderHostAbortRequested(ctx, { clearedPendingPrompts: clearedLocalPendingPrompts });
+      publish(ctx, "abort_requested", { source: "escape", clearedLocalPendingPrompts: true });
+      return true;
+    }
     connectHost(ctx);
+    const host = activeSessionKey ? readHostInfo(activeSessionKey, activeLane ?? currentLane()) : undefined;
     if (!hostSocket || hostSocket.destroyed) {
+      pendingHostPrompts.length = 0;
       pendingHostAbort = true;
       scheduleHostReconnect(ctx);
+      renderHostAbortRequested(ctx, { activePromptId: host?.activePromptId ?? undefined, clearedPendingPrompts: host?.pendingPrompts ?? 0 });
       return true;
     }
     pendingHostAbort = false;
     hostSocket.write(JSON.stringify({ type: "abort", source: "pi-sync", clientId: instanceId }) + "\n");
+    renderHostAbortRequested(ctx, { activePromptId: host?.activePromptId ?? undefined, clearedPendingPrompts: host?.pendingPrompts ?? 0 });
     publish(ctx, "abort_requested", { source: "escape" });
     return true;
   }
@@ -659,12 +1158,12 @@ export default function piSync(pi: ExtensionAPI) {
   function startTerminalInputSync(ctx: ExtensionContext): void {
     terminalInputUnsubscribe?.();
     terminalInputUnsubscribe = ctx.ui.onTerminalInput((data) => {
-      if (data !== "\x1b") return undefined;
+      if (!isEscapeInput(data)) return undefined;
       ensureActivePaths(ctx);
       connectHost(ctx);
       if (!hostHasActiveWork()) return undefined;
       sendHostAbort(ctx);
-      return { consume: true };
+      return undefined;
     });
   }
 
@@ -702,6 +1201,15 @@ export default function piSync(pi: ExtensionAPI) {
 
   function messageText(message: any): string | undefined {
     return extractMessageText(message);
+  }
+
+  async function waitForRemoteFlushBeforeLocalCommand(ctx: ExtensionContext): Promise<void> {
+    const startedAtMs = Date.now();
+    while (remoteTurnMaybeUnflushed && Date.now() - startedAtMs < 2_000) {
+      connectHost(ctx);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    refreshSessionFile(ctx);
   }
 
   function consumeReplayHistoryPersistedMessage(message: any): boolean {
@@ -830,7 +1338,7 @@ export default function piSync(pi: ExtensionAPI) {
   function ensureActivePaths(ctx: ExtensionContext): boolean {
     const file = sessionFile(ctx) ?? activeSessionFile;
     if (!file) return false;
-    const nextKey = stableSessionKey(file);
+    const nextKey = activeSessionKeyFor(ctx, file, activeSessionFile, activeSessionKey);
     const nextLane = currentLane();
     const changed = activeSessionKey !== undefined && (activeSessionKey !== nextKey || activeLane !== nextLane);
     if (changed) {
@@ -838,7 +1346,8 @@ export default function piSync(pi: ExtensionAPI) {
       readOffset = 0;
       clearSeenEvents();
       pendingHostPrompts.length = 0;
-      observedHostActiveWork = false;
+      hostAbortGraceStartedAt = 0;
+      hostAbortGraceUntil = 0;
       try { hostSocket?.end(); } catch {}
       hostSocket = undefined;
     }
@@ -847,6 +1356,8 @@ export default function piSync(pi: ExtensionAPI) {
     activeSessionKey = nextKey;
     activeLane = nextLane;
     activeEventPath = eventLogPath(activeSessionKey, activeLane);
+    ensureLane(activeSessionKey, file, activeLane, persistedLeafId(file) ?? sessionManager(ctx)?.getLeafId?.() ?? null);
+    exportLaneIdentity(ctx, file);
     mkdirSync(syncDir(activeSessionKey, activeLane), { recursive: true });
     if (!existsSync(activeEventPath)) writeFileSync(activeEventPath, "", "utf8");
     return true;
@@ -1012,6 +1523,7 @@ export default function piSync(pi: ExtensionAPI) {
           if (!rememberEvent(event.id)) continue;
           if (event.instanceId === instanceId) continue;
           if (event.type === "abort_requested") {
+            renderHostAbortRequested(ctx, event.payload);
             continue;
           }
           if (event.type === "prompt_echo") {
@@ -1093,6 +1605,97 @@ export default function piSync(pi: ExtensionAPI) {
     for (const delay of [0, 25, 100]) setTimeout(refresh, delay).unref?.();
   }
 
+  pi.registerCommand("lane", {
+    description: "Show, join, or create Pi sync lanes. Usage: /lane [status|new|join|list|identity|debug]",
+    handler: async (args: string, ctx: ExtensionContext) => {
+      const file = sessionFile(ctx);
+      if (!file) {
+        notifyLane(ctx, "pi-sync lane: no persisted session file");
+        return;
+      }
+      const key = activeSessionKeyFor(ctx, file, activeSessionFile, activeSessionKey);
+      const [rawCommand, rawName] = args.trim().split(/\s+/, 2);
+      const command = rawCommand || "status";
+
+      if (command === "new") {
+        const name = sanitizeLaneName(rawName || `lane-${Date.now().toString(36)}`);
+        const leaf = sessionManager(ctx)?.getLeafId?.() ?? null;
+        moduleCurrentLane = name;
+        ensureLane(key, file, name, leaf);
+        writeLaneInstance(ctx, file, "idle");
+        refreshAfterCommand(ctx);
+        notifyLane(ctx, `pi-sync lane: created and joined ${name}`);
+        return;
+      }
+
+      if (command === "join") {
+        const resolvedName = resolveLaneName(key, rawName || DEFAULT_LANE);
+        const name = resolvedName ? sanitizeLaneName(resolvedName) : sanitizeLaneName(rawName || DEFAULT_LANE);
+        const existingLane = resolvedName ? readLane(key, name) : undefined;
+        if (!existingLane) {
+          notifyLane(ctx, `pi-sync lane: no lane ${rawName || name}; use /lane list or /lane new ${name}`);
+          return;
+        }
+        sessionManager(ctx)?.setSessionFile?.(file);
+        moduleCurrentLane = name;
+        if (existingLane.headEntryId) sessionManager(ctx)?.branch?.(existingLane.headEntryId);
+        else sessionManager(ctx)?.resetLeaf?.();
+        writeLaneInstance(ctx, file, "idle");
+        refreshAfterCommand(ctx);
+        notifyLane(ctx, `pi-sync lane: joined ${existingLane.displayId ?? name} (${name})`);
+        return;
+      }
+
+      if (command === "list") {
+        const names = readLaneStates(key)
+          .sort((a, b) => (a.displayId ?? a.name).localeCompare(b.displayId ?? b.name, undefined, { numeric: true }))
+          .map((item) => `${item.displayId ?? item.name}(${item.name})`);
+        const instances = liveLaneInstances(key)
+          .map((item) => {
+            const lane = readLane(key, item.lane);
+            return `${lane?.displayId ?? item.lane}:${item.status}:${item.pid}`;
+          })
+          .join(", ");
+        const current = ensureLane(key, file, currentLane(), sessionManager(ctx)?.getLeafId?.() ?? null);
+        notifyLane(ctx, `pi-sync lane: lanes ${names.join(", ") || "L1(main)"}; current ${current.displayId ?? current.name}; instances ${instances || "none"}`);
+        return;
+      }
+
+      if (command === "instances") {
+        const instances = liveLaneInstances(key)
+          .map((item) => `${item.instanceId.slice(0, 8)} ${item.lane} ${item.status} pid=${item.pid} seen=${item.lastSeenAt}`)
+          .join("; ");
+        notifyLane(ctx, `pi-sync lane: instances ${instances || "none"}`);
+        return;
+      }
+
+      if (command === "identity" || command === "self") {
+        exportLaneIdentity(ctx, file);
+        notifyLane(ctx, `pi-sync lane: identity sessionId=${currentSessionId ?? "<none>"} sessionKey=${currentSessionKey} sessionFile=${currentSessionFile} instanceId=${instanceId} currentLane=${currentLane()} laneId=${process.env.PI_LANE_CURRENT_LANE_ID ?? "<none>"} laneFile=${process.env.PI_LANE_CURRENT_LANE_FILE ?? "<none>"} root=${laneRoot()} pid=${process.pid}`);
+        return;
+      }
+
+      if (command === "debug") {
+        notifyLane(ctx, `pi-sync lane: debug log ${debugLogPath(key)}`);
+        return;
+      }
+
+      if (command !== "status") {
+        notifyLane(ctx, `pi-sync lane: unknown command ${command}; try status, new, join, list, instances, identity, or debug`);
+        return;
+      }
+
+      const lane = ensureLane(key, file, currentLane(), sessionManager(ctx)?.getLeafId?.() ?? null);
+      const instances = liveLaneInstances(key, currentLane());
+      const host = readHostInfo(key, currentLane());
+      const freshHost = isHostFresh(host) ? host : undefined;
+      const hostSummary = freshHost
+        ? `host pid=${freshHost.pid} clients=${freshHost.clients ?? 0} active=${freshHost.activePromptId ?? "<none>"} pending=${freshHost.pendingPrompts ?? 0}`
+        : "host=<none>";
+      notifyLane(ctx, `pi-sync lane: current ${lane.displayId ?? lane.name} (${lane.name}); file ${lane.aliasPath ?? "<none>"}; head ${lane.headEntryId ?? "<empty>"}; connected ${instances.length}; ${hostSummary}`);
+    },
+  });
+
   pi.registerCommand("sync", {
     description: "Pi same-session live sync status. Usage: /sync [status|release|tail]",
     handler: async (args: string, ctx: ExtensionContext) => {
@@ -1120,7 +1723,7 @@ export default function piSync(pi: ExtensionAPI) {
       const freshHost = isHostFresh(host) ? host : undefined;
       const hasNativeReplay = typeof (ctx.ui as any).replayAgentEvent === "function";
       ctx.ui.notify(
-        `pi-sync: instance=${instanceId} sessionId=${sessionId(ctx) ?? "<none>"} sessionKey=${activeSessionKey} lane=${activeLane ?? currentLane()} nativeReplay=${hasNativeReplay ? "yes" : "no"} localOwnsTurn=${localOwnsTurn ? "yes" : "no"} activeOwner=${freshOwner?.instanceId ?? "<none>"} host=${freshHost ? `${freshHost.pid}/${freshHost.instanceId.slice(0, 8)}` : "<none>"} readOffset=${readOffset} events=${activeEventPath}`,
+        `pi-sync: instance=${instanceId} sessionId=${sessionId(ctx) ?? "<none>"} sessionKey=${activeSessionKey} sync=${activeLane ?? currentLane()} nativeReplay=${hasNativeReplay ? "yes" : "no"} localOwnsTurn=${localOwnsTurn ? "yes" : "no"} activeOwner=${freshOwner?.instanceId ?? "<none>"} host=${freshHost ? `${freshHost.pid}/${freshHost.instanceId.slice(0, 8)}` : "<none>"} readOffset=${readOffset} events=${activeEventPath}`,
         "info",
       );
     },
@@ -1130,6 +1733,7 @@ export default function piSync(pi: ExtensionAPI) {
     if (!ctx.hasUI) return;
     nativeReplay(ctx);
     if (EXACT_MODE) ctx.ui.setWorkingVisible(false);
+    initializeLaneSession(ctx);
     startTerminalInputSync(ctx);
     startPolling(ctx);
     ensureHost(ctx);
@@ -1141,6 +1745,8 @@ export default function piSync(pi: ExtensionAPI) {
     if (!ctx.hasUI) return;
     nativeReplay(ctx);
     selectedTreeCursorEntryId = (event as any).newLeafId ?? sessionManager(ctx)?.getLeafId?.() ?? null;
+    const file = sessionFile(ctx);
+    if (file) switchLaneForTreeSelection(ctx, file, selectedTreeCursorEntryId ?? null, (event as any).oldLeafId ?? null);
     ensureActivePaths(ctx);
     startPolling(ctx);
     ensureHost(ctx);
@@ -1164,6 +1770,7 @@ export default function piSync(pi: ExtensionAPI) {
     }
     if (!event.text.trimStart().startsWith("/")) {
       if (!ensureActivePaths(ctx)) return undefined;
+      if (activeSessionFile) writeLaneInstance(ctx, activeSessionFile, "active");
       ensureHost(ctx);
       connectHost(ctx);
       renderOptimisticUserMessage(ctx, event.text, "own");
@@ -1173,6 +1780,7 @@ export default function piSync(pi: ExtensionAPI) {
       }
       return { action: "handled" };
     }
+    await waitForRemoteFlushBeforeLocalCommand(ctx);
     refreshAfterCommand(ctx);
     return undefined;
   });
@@ -1234,12 +1842,32 @@ export default function piSync(pi: ExtensionAPI) {
     publish(ctx, "agent_end", event);
     refreshSessionFile(ctx);
     releaseTurn();
+    const file = activeSessionFile ?? sessionFile(ctx);
+    if (file) writeLaneInstance(ctx, file, "idle");
     scheduleQueuedInputDrain(ctx);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    stopRemoteWorking();
     shuttingDown = true;
     publish(ctx, "detach", { sessionId: activeSessionId, sessionFile: activeSessionFile, sessionKey: activeSessionKey });
+    if (laneHeartbeatTimer) clearInterval(laneHeartbeatTimer);
+    laneHeartbeatTimer = undefined;
+    if (currentSessionKey) {
+      writeJsonFile(instancePath(currentSessionKey, instanceId), {
+        instanceId,
+        pid: process.pid,
+        lane: currentLane(),
+        sessionId: currentSessionId ?? null,
+        sessionKey: currentSessionKey,
+        sessionFile: currentSessionFile,
+        leafId: null,
+        startedAt,
+        status: "disconnected",
+        lastSeenAt: nowIso(),
+      });
+    }
+    clearLaneIdentity();
     if (pollTimer) clearInterval(pollTimer);
     pollTimer = undefined;
     if (hostReconnectTimer) clearTimeout(hostReconnectTimer);
