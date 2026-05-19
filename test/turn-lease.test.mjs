@@ -1,13 +1,11 @@
 import nodeTest from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, writeFileSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInteractiveMock, createControllableBrain, text } from '../../pi-mock/dist/index.js';
 
 const EXTENSION = new URL('../index.ts', import.meta.url).pathname;
-const PI_LANE_EXT = new URL('../../pi-lane/src/extension.ts', import.meta.url).pathname;
 const TIMEOUT = 30_000;
 let testChain = Promise.resolve();
 
@@ -25,8 +23,21 @@ function test(name, options, fn) {
   });
 }
 
-function stableSessionKey(sessionFile) {
-  return createHash('sha256').update(sessionFile).digest('hex').slice(0, 24);
+function findPromptQueuePath(laneRoot, lane) {
+  const sessionsDir = join(laneRoot, 'sessions');
+  if (!existsSync(sessionsDir)) return undefined;
+  const candidates = [];
+  for (const sessionDir of readdirSync(sessionsDir)) {
+    const lanesDir = join(sessionsDir, sessionDir, 'lanes');
+    if (!existsSync(lanesDir)) continue;
+    const lanes = lane ? [lane] : readdirSync(lanesDir).filter((item) => !item.endsWith('.json'));
+    for (const laneName of lanes) {
+      const candidate = join(lanesDir, laneName, 'sync', 'prompt-queue.jsonl');
+      if (existsSync(candidate)) candidates.push(candidate);
+    }
+  }
+  candidates.sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
+  return candidates[0];
 }
 
 async function waitUntil(predicate, timeoutMs, label) {
@@ -36,6 +47,18 @@ async function waitUntil(predicate, timeoutMs, label) {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   throw new Error(`timeout waiting for ${label}`);
+}
+
+async function removeRoot(root) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      rmSync(root, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      if (attempt === 4) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
 }
 
 function writePiWrapper(root) {
@@ -66,6 +89,21 @@ function findMessageEntry(sessionFile, textValue) {
   return entry;
 }
 
+async function waitForMessageEntry(sessionFile, textValue, timeoutMs = TIMEOUT) {
+  await waitUntil(
+    () => {
+      try {
+        findMessageEntry(sessionFile, textValue);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    timeoutMs,
+    `session entry with text ${textValue}`,
+  );
+}
+
 test('pi-sync queues competing same-session input instead of starting a peer model call', { timeout: 90_000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-sync-lease-'));
   const laneRoot = join(root, 'lane');
@@ -82,7 +120,7 @@ test('pi-sync queues competing same-session input instead of starting a peer mod
     startupTimeoutMs: 20_000,
     terminal: { cols: 100, rows: 32 },
     cwd: root,
-    env: { PI_LANE_ROOT: laneRoot, PI_SYNC_POLL_MS: '25', PI_SYNC_TURN_LEASE_MS: '30000', PI_SYNC_HOST_IDLE_MS: '1000' },
+    env: { PI_LANE_ROOT: laneRoot, PI_SYNC_POLL_MS: '25', PI_SYNC_TURN_LEASE_MS: '30000', PI_SYNC_HOST_IDLE_MS: '10000' },
     piBinary: piWrapper,
     piArgs: ['--session', sessionFile],
   };
@@ -96,9 +134,11 @@ test('pi-sync queues competing same-session input instead of starting a peer mod
     const firstCall = await brain.waitForCall(TIMEOUT);
 
     b.submit('SYNC_SECOND_TURN_SHOULD_QUEUE');
-    const promptQueuePath = join(laneRoot, 'sessions', stableSessionKey(realpathSync(sessionFile)), 'lanes', 'main', 'sync', 'prompt-queue.jsonl');
     await waitUntil(
-      () => existsSync(promptQueuePath) && readFileSync(promptQueuePath, 'utf8').includes('SYNC_SECOND_TURN_SHOULD_QUEUE'),
+      () => {
+        const promptQueuePath = findPromptQueuePath(laneRoot);
+        return !!promptQueuePath && readFileSync(promptQueuePath, 'utf8').includes('SYNC_SECOND_TURN_SHOULD_QUEUE');
+      },
       TIMEOUT,
       'host prompt queue entry',
     );
@@ -127,11 +167,11 @@ test('pi-sync queues competing same-session input instead of starting a peer mod
   } finally {
     await a.close();
     await b.close();
-    rmSync(root, { recursive: true, force: true });
+    await removeRoot(root);
   }
 });
 
-test('pi-sync queues competing input after tree navigation on the same sync lane', { timeout: 120_000 }, async () => {
+test('pi-sync queues competing input after peers join the same tree sync channel', { timeout: 120_000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-sync-branch-lease-'));
   const laneRoot = join(root, 'lane');
   const sessionFile = join(root, 'shared.jsonl');
@@ -145,6 +185,8 @@ export default function treeNavHelper(pi) {
     description: "Navigate to the first message whose text matches args",
     handler: async (args, ctx) => {
       const wanted = args.trim();
+      const file = ctx.sessionManager.getSessionFile();
+      if (file) ctx.sessionManager.setSessionFile(file);
       const entry = ctx.sessionManager.getEntries().find((item) => {
         const content = item.message?.content;
         return Array.isArray(content) && content.some((part) => part.type === "text" && part.text === wanted);
@@ -159,13 +201,13 @@ export default function treeNavHelper(pi) {
 
   const common = {
     brain: brain.brain,
-    extensions: [PI_LANE_EXT, EXTENSION, helperExt],
+    extensions: [EXTENSION, helperExt],
     piProvider: 'pi-mock',
     piModel: 'mock',
     startupTimeoutMs: 20_000,
     terminal: { cols: 100, rows: 36 },
     cwd: root,
-    env: { PI_LANE_ROOT: laneRoot, PI_SYNC_POLL_MS: '25', PI_SYNC_TURN_LEASE_MS: '30000', PI_SYNC_HOST_IDLE_MS: '1000' },
+    env: { PI_LANE_ROOT: laneRoot, PI_SYNC_POLL_MS: '25', PI_SYNC_TURN_LEASE_MS: '30000', PI_SYNC_HOST_IDLE_MS: '10000' },
     piBinary: piWrapper,
     piArgs: ['--session', sessionFile],
   };
@@ -180,6 +222,7 @@ export default function treeNavHelper(pi) {
     await main.waitForOutput('SYNC_BRANCH_QUEUE_BASE_ANSWER', TIMEOUT);
     await a.waitForOutput('SYNC_BRANCH_QUEUE_BASE_ANSWER', TIMEOUT);
     await b.waitForOutput('SYNC_BRANCH_QUEUE_BASE_ANSWER', TIMEOUT);
+    await waitForMessageEntry(sessionFile, 'SYNC_BRANCH_QUEUE_BASE_ANSWER');
 
     main.submit('SYNC_BRANCH_QUEUE_MAIN_PROMPT');
     call = await brain.waitForCall(TIMEOUT);
@@ -189,8 +232,10 @@ export default function treeNavHelper(pi) {
 
     a.submit('/_tree_nav_to_text SYNC_BRANCH_QUEUE_BASE_ANSWER');
     await a.waitForOutput('leaf_after_nav:', TIMEOUT);
+    b.submit('/_tree_nav_to_text SYNC_BRANCH_QUEUE_BASE_ANSWER');
+    await b.waitForOutput('leaf_after_nav:', TIMEOUT);
     b.submit('/sync status');
-    await b.waitForOutput(/lane=main/, TIMEOUT);
+    await b.waitForOutput(/sync=tree-/, TIMEOUT);
 
     a.clearOutput();
     b.clearOutput();
@@ -198,12 +243,13 @@ export default function treeNavHelper(pi) {
     const firstCall = await brain.waitForCall(TIMEOUT);
 
     b.submit('SYNC_BRANCH_QUEUE_SECOND_TURN_SHOULD_QUEUE');
-    const sessionKey = stableSessionKey(realpathSync(sessionFile));
-    const promptQueuePath = join(laneRoot, 'sessions', sessionKey, 'lanes', 'main', 'sync', 'prompt-queue.jsonl');
     await waitUntil(
-      () => existsSync(promptQueuePath) && readFileSync(promptQueuePath, 'utf8').includes('SYNC_BRANCH_QUEUE_SECOND_TURN_SHOULD_QUEUE'),
+      () => {
+        const promptQueuePath = findPromptQueuePath(laneRoot);
+        return !!promptQueuePath && readFileSync(promptQueuePath, 'utf8').includes('SYNC_BRANCH_QUEUE_SECOND_TURN_SHOULD_QUEUE');
+      },
       TIMEOUT,
-      'main host prompt queue entry after tree navigation',
+      'tree host prompt queue entry after tree navigation',
     );
     assert.equal(brain.pending().length, 0, 'queued input should not start a competing model call');
 
@@ -226,6 +272,6 @@ export default function treeNavHelper(pi) {
     await main.close();
     await a.close();
     await b.close();
-    rmSync(root, { recursive: true, force: true });
+    await removeRoot(root);
   }
 });

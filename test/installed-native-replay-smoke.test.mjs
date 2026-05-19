@@ -53,6 +53,7 @@ function makeInstalledAgentDir(root, port) {
   const settings = JSON.parse(readFileSync(join(source, 'settings.json'), 'utf8'));
   settings.defaultProvider = 'pi-mock';
   settings.defaultModel = 'mock';
+  settings.enabledModels = Array.from(new Set([...(settings.enabledModels ?? []), 'pi-mock/mock', 'mock']));
   writeFileSync(join(dir, 'settings.json'), JSON.stringify(settings, null, 2));
 
   let models = { providers: {} };

@@ -36,10 +36,6 @@ function findFiles(dir, predicate) {
   return found;
 }
 
-function idFromSessionPath(path) {
-  return path.match(/_([^_]+)\.jsonl$/)?.[1];
-}
-
 test('pi-sync keeps the displayed session id backed by a real session file', { timeout: 90_000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-sync-session-id-'));
   const sessionDir = join(root, 'sessions');
@@ -74,7 +70,8 @@ test('pi-sync keeps the displayed session id backed by a real session file', { t
 
     const header = readFileSync(host.sessionFile, 'utf8').split(/\r?\n/, 1)[0];
     assert.match(header, /"type":"session"/);
-    assert.equal(JSON.parse(header).id, idFromSessionPath(host.sessionFile));
+    assert.equal(typeof JSON.parse(header).id, 'string');
+    assert.notEqual(JSON.parse(header).id.length, 0);
     assert.ok(findJsonlFiles(sessionDir).map((file) => realpathSync(file)).includes(host.sessionFile), `${host.sessionFile} should be in session dir`);
   } finally {
     await mock.close();

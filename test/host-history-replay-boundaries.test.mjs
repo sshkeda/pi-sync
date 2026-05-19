@@ -205,7 +205,7 @@ test('pi-sync does not replay a completed host history over already-rendered per
       startupTimeoutMs: 20_000,
       terminal: { cols: 100, rows: 32 },
       cwd: root,
-      env: { PI_LANE_ROOT: laneRoot, PI_SYNC_POLL_MS: '25', PI_SYNC_HOST_IDLE_MS: '5000' },
+      env: { PI_LANE_ROOT: laneRoot, PI_LANE_SESSION_KEY: sessionKey, PI_LANE_SESSION_FILE: canonicalSessionFile, PI_SYNC_POLL_MS: '25', PI_SYNC_HOST_IDLE_MS: '5000' },
       piBinary: piWrapper,
       piArgs: ['--session', sessionFile],
     });
@@ -250,7 +250,7 @@ test('pi-sync replays only the missing assistant side when the user prompt is al
       startupTimeoutMs: 20_000,
       terminal: { cols: 100, rows: 32 },
       cwd: root,
-      env: { PI_LANE_ROOT: laneRoot, PI_SYNC_POLL_MS: '25', PI_SYNC_HOST_IDLE_MS: '5000' },
+      env: { PI_LANE_ROOT: laneRoot, PI_LANE_SESSION_KEY: sessionKey, PI_LANE_SESSION_FILE: canonicalSessionFile, PI_SYNC_POLL_MS: '25', PI_SYNC_HOST_IDLE_MS: '5000' },
       piBinary: piWrapper,
       piArgs: ['--session', sessionFile],
     });

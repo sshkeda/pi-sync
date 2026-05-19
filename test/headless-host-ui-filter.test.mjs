@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -63,6 +63,20 @@ async function waitUntil(predicate, timeoutMs, label) {
   throw new Error(`timeout waiting for ${label}`);
 }
 
+function findFile(dir, fileName) {
+  if (!existsSync(dir)) return undefined;
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      const found = findFile(path, fileName);
+      if (found) return found;
+    } else if (entry.isFile() && entry.name === fileName && path.includes('/sync/')) {
+      return path;
+    }
+  }
+  return undefined;
+}
+
 async function stopChild(child) {
   if (child.exitCode !== null || child.signalCode !== null) return;
   child.kill('SIGTERM');
@@ -108,14 +122,15 @@ test('pi-sync host filters UI-only extensions from headless installed config', {
     await mock.waitForOutput('SYNC_HOST_FILTER_RESPONSE', TIMEOUT);
     await new Promise((resolve) => setTimeout(resolve, 250));
 
-    const sessionKey = stableSessionKey(realpathSync(sessionFile));
-    const hostEventsPath = join(laneRoot, 'sessions', sessionKey, 'lanes', 'main', 'sync', 'host-events.jsonl');
+    const hostEventsPath = findFile(laneRoot, 'host-events.jsonl');
+    assert.ok(hostEventsPath, 'expected host-events.jsonl');
     const events = readFileSync(hostEventsPath, 'utf8');
     assert.doesNotMatch(events, /"type":"host_error"/, events);
     assert.doesNotMatch(events, /Theme not initialized/, events);
     assert.doesNotMatch(events, /"type":"host_shutdown".*"uncaught_exception"/, events);
 
-    const hostAgentSettingsPath = join(laneRoot, 'sessions', sessionKey, 'lanes', 'main', 'sync', 'host-agent', 'settings.json');
+    const hostAgentSettingsPath = findFile(laneRoot, 'settings.json');
+    assert.ok(hostAgentSettingsPath, 'expected host-agent settings.json');
     const hostSettings = JSON.parse(readFileSync(hostAgentSettingsPath, 'utf8'));
     assert.deepEqual(hostSettings.packages, [], 'headless host should not load pi-working or pi-sync from installed packages');
   } finally {

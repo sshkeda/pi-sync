@@ -8,7 +8,6 @@ import { createInteractiveMock, streamText } from '../../pi-mock/dist/index.js';
 const PI_SYNC = new URL('../index.ts', import.meta.url).pathname;
 const PI_WORKING = new URL('../../pi-working/index.ts', import.meta.url).pathname;
 const PI_STATUS_LINE = new URL('../../pi-status-line/index.ts', import.meta.url).pathname;
-const PI_LANE = new URL('../../pi-lane/index.ts', import.meta.url).pathname;
 
 function readEntries(path) {
   return readFileSync(path, 'utf8')
@@ -87,7 +86,7 @@ test('pi-sync leaves pi-status-line on persisted assistant leaf with nonzero com
   writeFileSync(sessionFile, '', 'utf8');
   const mock = await createInteractiveMock({
     brain: () => streamText(['SYNC_STATUS_TIME_DONE'], 1300),
-    extensions: [PI_LANE, PI_WORKING, PI_STATUS_LINE, PI_SYNC],
+    extensions: [PI_WORKING, PI_STATUS_LINE, PI_SYNC],
     piProvider: 'pi-mock',
     piModel: 'mock',
     startupTimeoutMs: 20_000,
@@ -106,11 +105,11 @@ test('pi-sync leaves pi-status-line on persisted assistant leaf with nonzero com
 
     const screen = await waitForScreenMatch(
       mock,
-      /@[2-9]\d* [^\n]*[1-9]\d*s/,
+      /~\/1 [^\n]*[1-9]\d*s/,
       5_000,
       'status line should show assistant leaf and completed work time',
     );
-    assert.match(screen, /@[2-9]\d* [^\n]*[1-9]\d*s/, 'status line should show assistant leaf and completed work time');
+    assert.match(screen, /~\/1 [^\n]*[1-9]\d*s/, 'status line should show assistant leaf and completed work time');
 
     const messages = readEntries(sessionFile).filter((entry) => entry.type === 'message');
     const user = messages.find((entry) => entry.message?.role === 'user' && entry.message?.content?.[0]?.text === 'test persisted assistant status time');

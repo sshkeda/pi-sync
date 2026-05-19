@@ -1,17 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, readdirSync, writeFileSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInteractiveMock, script, text } from '../../pi-mock/dist/index.js';
 
 const EXTENSION = new URL('../index.ts', import.meta.url).pathname;
 const TIMEOUT = 30_000;
-
-function stableSessionKey(sessionFile) {
-  return createHash('sha256').update(sessionFile).digest('hex').slice(0, 24);
-}
 
 async function waitUntil(predicate, timeoutMs, label) {
   const start = Date.now();
@@ -40,6 +35,17 @@ function findHostJsons(dir) {
   return found;
 }
 
+function findHostEventsPaths(dir) {
+  if (!existsSync(dir)) return [];
+  const found = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) found.push(...findHostEventsPaths(path));
+    else if (entry.isFile() && entry.name === 'host-events.jsonl' && path.includes('/sync/')) found.push(path);
+  }
+  return found;
+}
+
 test('pi-sync routes single-terminal prompts through a warm shared host', { timeout: 90_000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-sync-native-path-'));
   const laneRoot = join(root, 'lane');
@@ -62,9 +68,8 @@ test('pi-sync routes single-terminal prompts through a warm shared host', { time
 
   try {
     mock.clearOutput();
-    const hostEventsPath = join(laneRoot, 'sessions', stableSessionKey(realpathSync(sessionFile)), 'lanes', 'main', 'sync', 'host-events.jsonl');
     await waitUntil(
-      () => existsSync(hostEventsPath) && readFileSync(hostEventsPath, 'utf8').includes('"type":"agent_ready"'),
+      () => findHostEventsPaths(laneRoot).some((path) => readFileSync(path, 'utf8').includes('"type":"agent_ready"')),
       TIMEOUT,
       'warm host agent_ready event',
     );

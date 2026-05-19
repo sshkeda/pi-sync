@@ -1,17 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createHash } from 'node:crypto';
 import { createInteractiveMock, createControllableBrain, text } from '../../pi-mock/dist/index.js';
 
 const TIMEOUT = 30_000;
 const PI_BINARY = process.env.PI_SYNC_TEST_PI_BINARY ?? 'pi';
-
-function stableSessionKey(sessionFile) {
-  return createHash('sha256').update(sessionFile).digest('hex').slice(0, 24);
-}
 
 async function waitUntil(predicate, timeoutMs, label) {
   const start = Date.now();
@@ -20,6 +15,17 @@ async function waitUntil(predicate, timeoutMs, label) {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   throw new Error(`timeout waiting for ${label}`);
+}
+
+function findHostEventsPaths(dir) {
+  if (!existsSync(dir)) return [];
+  const found = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) found.push(...findHostEventsPaths(path));
+    else if (entry.isFile() && entry.name === 'host-events.jsonl' && path.includes('/sync/')) found.push(path);
+  }
+  return found;
 }
 
 function writePiWrapper(root) {
@@ -81,9 +87,8 @@ test('pi-sync warm installed-stack submit reaches provider without reconnect del
   });
 
   try {
-    const hostEventsPath = join(laneRoot, 'sessions', stableSessionKey(realpathSync(sessionFile)), 'lanes', 'main', 'sync', 'host-events.jsonl');
     await waitUntil(
-      () => existsSync(hostEventsPath) && readFileSync(hostEventsPath, 'utf8').includes('"type":"agent_ready"'),
+      () => findHostEventsPaths(laneRoot).some((path) => readFileSync(path, 'utf8').includes('"type":"agent_ready"')),
       TIMEOUT,
       'warm host agent_ready event',
     );

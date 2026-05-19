@@ -1,13 +1,11 @@
 import nodeTest from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdtempSync, realpathSync, readFileSync, readdirSync, symlinkSync, writeFileSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, realpathSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createHash } from 'node:crypto';
 import { createInteractiveMock, createControllableBrain, script, text } from '../../pi-mock/dist/index.js';
 
 const EXTENSION = new URL('../index.ts', import.meta.url).pathname;
-const PI_LANE_EXT = new URL('../../pi-lane/src/extension.ts', import.meta.url).pathname;
 const TIMEOUT = 30_000;
 let testChain = Promise.resolve();
 
@@ -27,10 +25,6 @@ function test(name, options, fn) {
 
 function countVisible(lines, needle) {
   return lines.filter((line) => line.includes(needle)).length;
-}
-
-function stableSessionKey(sessionFile) {
-  return createHash('sha256').update(sessionFile).digest('hex').slice(0, 24);
 }
 
 function readSessionEntries(sessionFile) {
@@ -61,6 +55,42 @@ function findMessageEntries(sessionFile, text) {
   return readSessionEntries(sessionFile).filter((item) => messageText(item) === text);
 }
 
+async function waitForMessageEntry(sessionFile, text, timeoutMs = TIMEOUT) {
+  let entry;
+  try {
+    await waitUntil(
+      () => {
+        entry = readSessionEntries(sessionFile).find((item) => messageText(item) === text);
+        return !!entry;
+      },
+      timeoutMs,
+      `session entry with text ${text}`,
+    );
+  } catch (error) {
+    const preview = existsSync(sessionFile) ? readFileSync(sessionFile, 'utf8') : '<missing>';
+    throw new Error(`${error.message}\nSession file ${sessionFile}:\n${preview}`);
+  }
+  return entry;
+}
+
+async function waitForMessageEntries(sessionFile, text, count = 1, timeoutMs = TIMEOUT) {
+  let entries = [];
+  try {
+    await waitUntil(
+      () => {
+        entries = findMessageEntries(sessionFile, text);
+        return entries.length >= count;
+      },
+      timeoutMs,
+      `${count} session entries with text ${text}`,
+    );
+  } catch (error) {
+    const preview = existsSync(sessionFile) ? readFileSync(sessionFile, 'utf8') : '<missing>';
+    throw new Error(`${error.message}\nSession file ${sessionFile}:\n${preview}`);
+  }
+  return entries;
+}
+
 function assertNoHiddenBranchLanes(laneRoot) {
   const hidden = [];
   function visit(dir) {
@@ -75,6 +105,60 @@ function assertNoHiddenBranchLanes(laneRoot) {
   assert.deepEqual(hidden, [], `hidden branch lane paths must not exist:\n${hidden.join('\n')}`);
 }
 
+function findLaneStatePath(laneRoot, lane = 'main') {
+  const sessionsDir = join(laneRoot, 'sessions');
+  if (!existsSync(sessionsDir)) return undefined;
+  const candidates = [];
+  for (const sessionDir of readdirSync(sessionsDir)) {
+    const candidate = join(sessionsDir, sessionDir, 'lanes', `${lane}.json`);
+    if (existsSync(candidate)) candidates.push(candidate);
+  }
+  candidates.sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
+  return candidates[0];
+}
+
+function readLaneStates(laneRoot) {
+  const sessionsDir = join(laneRoot, 'sessions');
+  if (!existsSync(sessionsDir)) return [];
+  return readdirSync(sessionsDir).flatMap((sessionDir) => {
+    const lanesDir = join(laneRoot, 'sessions', sessionDir, 'lanes');
+    if (!existsSync(lanesDir)) return [];
+    return readdirSync(lanesDir)
+      .filter((item) => item.endsWith('.json'))
+      .map((item) => JSON.parse(readFileSync(join(lanesDir, item), 'utf8')));
+  });
+}
+
+function findHostJsons(dir) {
+  if (!existsSync(dir)) return [];
+  const found = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) found.push(...findHostJsons(path));
+    else if (entry.isFile() && entry.name === 'host.json' && path.includes('/sync/')) found.push(path);
+  }
+  return found;
+}
+
+function findSessionRuntimeDirs(laneRoot) {
+  const sessionsDir = join(laneRoot, 'sessions');
+  if (!existsSync(sessionsDir)) return [];
+  return readdirSync(sessionsDir)
+    .map((name) => join(sessionsDir, name))
+    .filter((path) => existsSync(join(path, 'lanes', 'main.json')));
+}
+
+async function assertSingleRuntimeDir(laneRoot, label = 'single sync runtime') {
+  await waitUntil(() => findSessionRuntimeDirs(laneRoot).length >= 1, TIMEOUT, label);
+  const runtimeDirs = findSessionRuntimeDirs(laneRoot);
+  assert.equal(
+    runtimeDirs.length,
+    1,
+    `${label} must not split one session file into multiple sync keys:\n${runtimeDirs.join('\n')}`,
+  );
+  return runtimeDirs[0];
+}
+
 async function waitUntil(predicate, timeoutMs, label) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -82,6 +166,27 @@ async function waitUntil(predicate, timeoutMs, label) {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   throw new Error(`timeout waiting for ${label}`);
+}
+
+async function waitUntilQuiet(predicate, timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (predicate()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return false;
+}
+
+async function removeRoot(root) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      rmSync(root, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      if (attempt === 4 || !['ENOTEMPTY', 'EBUSY', 'ENOENT'].includes(error?.code)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
 }
 
 test('pi-sync publishes live updates from one same-session terminal to another', { timeout: 90_000 }, async () => {
@@ -120,7 +225,7 @@ test('pi-sync publishes live updates from one same-session terminal to another',
   } finally {
     await a.close();
     await b.close();
-    rmSync(root, { recursive: true, force: true });
+    await removeRoot(root);
   }
 });
 
@@ -165,7 +270,7 @@ test('pi-sync attached peer renders an active prompt once before response finish
   } finally {
     await a.close();
     await b.close();
-    rmSync(root, { recursive: true, force: true });
+    await removeRoot(root);
   }
 });
 
@@ -203,18 +308,236 @@ test('pi-sync treats symlink and real session paths as one shared session', { ti
     await b.waitForOutput('SYNC_ALIAS_USER_PROMPT', TIMEOUT);
     await b.waitForOutput('SYNC_ALIAS_ASSISTANT_RESPONSE', TIMEOUT);
 
-    const canonicalKey = stableSessionKey(realpathSync(sessionFile));
-    const aliasKey = stableSessionKey(sessionAlias);
-    assert.ok(existsSync(join(laneRoot, 'sessions', canonicalKey, 'lanes', 'main', 'sync', 'host.json')));
-    assert.equal(existsSync(join(laneRoot, 'sessions', aliasKey, 'lanes', 'main', 'sync', 'host.json')), false);
+    const hostJsons = findHostJsons(laneRoot);
+    assert.equal(hostJsons.length, 1, hostJsons.join('\n'));
+    const host = JSON.parse(readFileSync(hostJsons[0], 'utf8'));
+    assert.equal(realpathSync(host.sessionFile), realpathSync(sessionFile));
   } finally {
     await a.close();
     await b.close();
-    rmSync(root, { recursive: true, force: true });
+    await removeRoot(root);
   }
 });
 
-test('pi-sync keeps tree navigation on the current sync lane and mirrors the forked path', { timeout: 120_000 }, async () => {
+test('pi-sync keeps one sync key when Pi session id changes during startup', { timeout: 90_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-sync-session-id-churn-'));
+  const laneRoot = join(root, 'lane');
+  const sessionFile = join(root, 'shared.jsonl');
+  const piWrapper = join(root, 'pi-wrapper.sh');
+  const sessionIdChurnExtension = join(root, 'session-id-churn-extension.ts');
+  writeFileSync(sessionFile, '', 'utf8');
+  writeFileSync(piWrapper, `#!/usr/bin/env bash\nargs=()\nfor a in "$@"; do [[ "$a" == "--no-session" ]] && continue; args+=("$a"); done\nexec "${process.env.PI_SYNC_TEST_PI_BINARY ?? 'pi'}" "\${args[@]}"\n`);
+  chmodSync(piWrapper, 0o755);
+  writeFileSync(
+    sessionIdChurnExtension,
+    `export default function(pi) {
+  pi.on("session_start", (_event, ctx) => {
+    const original = ctx.sessionManager.getSessionId.bind(ctx.sessionManager);
+    let calls = 0;
+    ctx.sessionManager.getSessionId = () => {
+      calls += 1;
+      return calls <= 8 ? "transient-startup-session-id" : (original() || "hydrated-session-id");
+    };
+  });
+}
+`,
+    'utf8',
+  );
+
+  const mock = await createInteractiveMock({
+    brain: script(text('SYNC_ID_CHURN_RESPONSE')),
+    extensions: [sessionIdChurnExtension, EXTENSION],
+    piProvider: 'pi-mock',
+    piModel: 'mock',
+    startupTimeoutMs: 20_000,
+    terminal: { cols: 100, rows: 32 },
+    cwd: root,
+    env: { PI_LANE_ROOT: laneRoot, PI_SYNC_POLL_MS: '25', PI_SYNC_HOST_IDLE_MS: '1000' },
+    piBinary: piWrapper,
+    piArgs: ['--session', sessionFile],
+  });
+
+  try {
+    mock.submit('SYNC_ID_CHURN_PROMPT');
+    await mock.waitForOutput('SYNC_ID_CHURN_RESPONSE', TIMEOUT);
+    await waitUntil(() => findHostJsons(laneRoot).length >= 1, TIMEOUT, 'host json after session id churn');
+    await assertSingleRuntimeDir(laneRoot, 'session id churn');
+  } finally {
+    await mock.close();
+    await removeRoot(root);
+  }
+});
+
+test('pi-sync shares one runtime when same-session peers report different session ids', { timeout: 90_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-sync-peer-id-mismatch-'));
+  const laneRoot = join(root, 'lane');
+  const sessionFile = join(root, 'shared.jsonl');
+  const piWrapper = join(root, 'pi-wrapper.sh');
+  const forcedSessionIdExtension = join(root, 'forced-session-id-extension.ts');
+  writeFileSync(sessionFile, '', 'utf8');
+  writeFileSync(piWrapper, `#!/usr/bin/env bash\nargs=()\nfor a in "$@"; do [[ "$a" == "--no-session" ]] && continue; args+=("$a"); done\nexec "${process.env.PI_SYNC_TEST_PI_BINARY ?? 'pi'}" "\${args[@]}"\n`);
+  chmodSync(piWrapper, 0o755);
+  writeFileSync(
+    forcedSessionIdExtension,
+    `export default function(pi) {
+  pi.on("session_start", (_event, ctx) => {
+    const forced = process.env.PI_SYNC_TEST_FORCED_SESSION_ID;
+    if (forced) ctx.sessionManager.getSessionId = () => forced;
+  });
+}
+`,
+    'utf8',
+  );
+
+  const common = {
+    brain: script(text('SYNC_PEER_ID_MISMATCH_RESPONSE')),
+    extensions: [forcedSessionIdExtension, EXTENSION],
+    piProvider: 'pi-mock',
+    piModel: 'mock',
+    startupTimeoutMs: 20_000,
+    terminal: { cols: 100, rows: 32 },
+    cwd: root,
+    env: { PI_LANE_ROOT: laneRoot, PI_SYNC_POLL_MS: '25', PI_SYNC_HOST_IDLE_MS: '1000' },
+    piBinary: piWrapper,
+    piArgs: ['--session', sessionFile],
+  };
+
+  const a = await createInteractiveMock({
+    ...common,
+    env: { ...common.env, PI_SYNC_TEST_FORCED_SESSION_ID: 'peer-a-transient-id' },
+  });
+  const b = await createInteractiveMock({
+    ...common,
+    env: { ...common.env, PI_SYNC_TEST_FORCED_SESSION_ID: 'peer-b-hydrated-id' },
+  });
+  try {
+    a.clearOutput();
+    b.clearOutput();
+    a.submit('SYNC_PEER_ID_MISMATCH_PROMPT');
+    await a.waitForOutput('SYNC_PEER_ID_MISMATCH_RESPONSE', TIMEOUT);
+    await b.waitForOutput('SYNC_PEER_ID_MISMATCH_PROMPT', TIMEOUT);
+    await b.waitForOutput('SYNC_PEER_ID_MISMATCH_RESPONSE', TIMEOUT);
+    await assertSingleRuntimeDir(laneRoot, 'peer session id mismatch');
+  } finally {
+    await a.close();
+    await b.close();
+    await removeRoot(root);
+  }
+});
+
+test('pi-sync ignores stale inherited sync keys for a different session file', { timeout: 90_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-sync-stale-env-key-'));
+  const laneRoot = join(root, 'lane');
+  const staleSessionFile = join(root, 'stale.jsonl');
+  const sessionFile = join(root, 'shared.jsonl');
+  const piWrapper = join(root, 'pi-wrapper.sh');
+  writeFileSync(staleSessionFile, '', 'utf8');
+  writeFileSync(sessionFile, '', 'utf8');
+  writeFileSync(piWrapper, `#!/usr/bin/env bash\nargs=()\nfor a in "$@"; do [[ "$a" == "--no-session" ]] && continue; args+=("$a"); done\nexec "${process.env.PI_SYNC_TEST_PI_BINARY ?? 'pi'}" "\${args[@]}"\n`);
+  chmodSync(piWrapper, 0o755);
+
+  const common = {
+    brain: script(text('SYNC_STALE_ENV_RESPONSE')),
+    extensions: [EXTENSION],
+    piProvider: 'pi-mock',
+    piModel: 'mock',
+    startupTimeoutMs: 20_000,
+    terminal: { cols: 100, rows: 32 },
+    cwd: root,
+    env: { PI_LANE_ROOT: laneRoot, PI_SYNC_POLL_MS: '25', PI_SYNC_HOST_IDLE_MS: '1000' },
+    piBinary: piWrapper,
+    piArgs: ['--session', sessionFile],
+  };
+
+  const staleKeyEnv = {
+    PI_SYNC_SESSION_KEY: 'stale-inherited-key',
+    PI_SYNC_SESSION_FILE: realpathSync(staleSessionFile),
+    PI_LANE_SESSION_KEY: 'stale-inherited-key',
+    PI_LANE_SESSION_FILE: realpathSync(staleSessionFile),
+  };
+  const a = await createInteractiveMock({ ...common, env: { ...common.env, ...staleKeyEnv } });
+  const b = await createInteractiveMock(common);
+  try {
+    a.clearOutput();
+    b.clearOutput();
+    a.submit('SYNC_STALE_ENV_PROMPT');
+    await a.waitForOutput('SYNC_STALE_ENV_RESPONSE', TIMEOUT);
+    await b.waitForOutput('SYNC_STALE_ENV_PROMPT', TIMEOUT);
+    await b.waitForOutput('SYNC_STALE_ENV_RESPONSE', TIMEOUT);
+    const runtimeDir = await assertSingleRuntimeDir(laneRoot, 'stale inherited sync key');
+    assert.doesNotMatch(runtimeDir, /stale-inherited-key/, runtimeDir);
+  } finally {
+    await a.close();
+    await b.close();
+    await removeRoot(root);
+  }
+});
+
+test('pi-sync shares one runtime across alias paths and different peer session ids', { timeout: 90_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-sync-alias-id-mismatch-'));
+  const laneRoot = join(root, 'lane');
+  const sessionFile = join(root, 'shared.jsonl');
+  const sessionAlias = join(root, 'shared-alias.jsonl');
+  const piWrapper = join(root, 'pi-wrapper.sh');
+  const forcedSessionIdExtension = join(root, 'forced-session-id-extension.ts');
+  writeFileSync(sessionFile, '', 'utf8');
+  symlinkSync(sessionFile, sessionAlias);
+  writeFileSync(piWrapper, `#!/usr/bin/env bash\nargs=()\nfor a in "$@"; do [[ "$a" == "--no-session" ]] && continue; args+=("$a"); done\nexec "${process.env.PI_SYNC_TEST_PI_BINARY ?? 'pi'}" "\${args[@]}"\n`);
+  chmodSync(piWrapper, 0o755);
+  writeFileSync(
+    forcedSessionIdExtension,
+    `export default function(pi) {
+  pi.on("session_start", (_event, ctx) => {
+    const forced = process.env.PI_SYNC_TEST_FORCED_SESSION_ID;
+    if (forced) ctx.sessionManager.getSessionId = () => forced;
+  });
+}
+`,
+    'utf8',
+  );
+
+  const common = {
+    brain: script(text('SYNC_ALIAS_ID_RESPONSE')),
+    extensions: [forcedSessionIdExtension, EXTENSION],
+    piProvider: 'pi-mock',
+    piModel: 'mock',
+    startupTimeoutMs: 20_000,
+    terminal: { cols: 100, rows: 32 },
+    cwd: root,
+    env: { PI_LANE_ROOT: laneRoot, PI_SYNC_POLL_MS: '25', PI_SYNC_HOST_IDLE_MS: '1000' },
+    piBinary: piWrapper,
+  };
+
+  const a = await createInteractiveMock({
+    ...common,
+    env: { ...common.env, PI_SYNC_TEST_FORCED_SESSION_ID: 'alias-peer-id' },
+    piArgs: ['--session', sessionAlias],
+  });
+  const b = await createInteractiveMock({
+    ...common,
+    env: { ...common.env, PI_SYNC_TEST_FORCED_SESSION_ID: 'realpath-peer-id' },
+    piArgs: ['--session', sessionFile],
+  });
+  try {
+    a.clearOutput();
+    b.clearOutput();
+    a.submit('SYNC_ALIAS_ID_PROMPT');
+    await a.waitForOutput('SYNC_ALIAS_ID_RESPONSE', TIMEOUT);
+    await b.waitForOutput('SYNC_ALIAS_ID_PROMPT', TIMEOUT);
+    await b.waitForOutput('SYNC_ALIAS_ID_RESPONSE', TIMEOUT);
+    await assertSingleRuntimeDir(laneRoot, 'alias path plus session id mismatch');
+    const hostJsons = findHostJsons(laneRoot);
+    assert.equal(hostJsons.length, 1, hostJsons.join('\n'));
+    const host = JSON.parse(readFileSync(hostJsons[0], 'utf8'));
+    assert.equal(realpathSync(host.sessionFile), realpathSync(sessionFile));
+  } finally {
+    await a.close();
+    await b.close();
+    await removeRoot(root);
+  }
+});
+
+test('pi-sync switches tree navigation to a separate sync lane without dragging main', { timeout: 120_000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-sync-tree-branch-'));
   const laneRoot = join(root, 'lane');
   const sessionFile = join(root, 'shared.jsonl');
@@ -227,6 +550,8 @@ export default function treeNavHelper(pi) {
     description: "Navigate to the first message whose text matches args",
     handler: async (args, ctx) => {
       const wanted = args.trim();
+      const file = ctx.sessionManager.getSessionFile();
+      if (file) ctx.sessionManager.setSessionFile(file);
       const entry = ctx.sessionManager.getEntries().find((item) => {
         const content = item.message?.content;
         return Array.isArray(content) && content.some((part) => part.type === "text" && part.text === wanted);
@@ -247,7 +572,7 @@ export default function treeNavHelper(pi) {
       text('SYNC_TREE_SECOND_ANSWER'),
       text('SYNC_TREE_BRANCH_ANSWER'),
     ),
-    extensions: [PI_LANE_EXT, EXTENSION, helperExt],
+    extensions: [EXTENSION, helperExt],
     piProvider: 'pi-mock',
     piModel: 'mock',
     startupTimeoutMs: 20_000,
@@ -268,9 +593,14 @@ export default function treeNavHelper(pi) {
     a.submit('SYNC_TREE_SECOND_PROMPT');
     await a.waitForOutput('SYNC_TREE_SECOND_ANSWER', TIMEOUT);
     await b.waitForOutput('SYNC_TREE_SECOND_ANSWER', TIMEOUT);
+    await waitForMessageEntry(sessionFile, 'SYNC_TREE_SECOND_ANSWER');
 
     b.submit('/_tree_nav_to_text SYNC_TREE_BASE_ANSWER');
     await b.waitForOutput('leaf_after_nav:', TIMEOUT);
+    b.submit('/sync status');
+    await b.waitForOutput(/sync=tree-/, TIMEOUT);
+    a.submit('/sync status');
+    await a.waitForOutput(/sync=main/, TIMEOUT);
 
     a.clearOutput();
     b.clearOutput();
@@ -278,13 +608,12 @@ export default function treeNavHelper(pi) {
     await b.waitForOutput('SYNC_TREE_BRANCH_ANSWER', TIMEOUT);
     await new Promise((resolve) => setTimeout(resolve, 1000));
 
-    await a.waitForOutput('SYNC_TREE_BRANCH_PROMPT', TIMEOUT);
-    await a.waitForOutput('SYNC_TREE_BRANCH_ANSWER', TIMEOUT);
+    assert.doesNotMatch(a.output, /SYNC_TREE_BRANCH_PROMPT|SYNC_TREE_BRANCH_ANSWER/, 'main lane terminal must not mirror tree-lane prompt');
 
     const sessionDirs = readdirSync(join(laneRoot, 'sessions'));
     const lanes = sessionDirs.flatMap((sessionDir) => readdirSync(join(laneRoot, 'sessions', sessionDir, 'lanes')));
     assert.ok(lanes.includes('main.json'), lanes.join('\n'));
-    assertNoHiddenBranchLanes(laneRoot);
+    assert.ok(lanes.some((item) => item.startsWith('tree-') && item.endsWith('.json')), lanes.join('\n'));
 
     const baseAnswer = findMessageEntry(sessionFile, 'SYNC_TREE_BASE_ANSWER');
     const secondAnswer = findMessageEntry(sessionFile, 'SYNC_TREE_SECOND_ANSWER');
@@ -292,20 +621,20 @@ export default function treeNavHelper(pi) {
     assert.equal(branchPrompt.parentId, baseAnswer.id, 'branch prompt should be appended under the selected tree leaf');
     assert.notEqual(branchPrompt.parentId, secondAnswer.id, 'branch prompt must not append to the previous main tail');
     const branchAnswer = findMessageEntry(sessionFile, 'SYNC_TREE_BRANCH_ANSWER');
-    const mainLanePath = join(laneRoot, 'sessions', stableSessionKey(realpathSync(sessionFile)), 'lanes', 'main.json');
-    await waitUntil(
-      () => JSON.parse(readFileSync(mainLanePath, 'utf8')).headEntryId === branchAnswer.id,
-      TIMEOUT,
-      'main lane head update',
-    );
+    const states = readLaneStates(laneRoot);
+    const mainLane = states.find((item) => item.name === 'main');
+    const treeLane = states.find((item) => item.name?.startsWith('tree-'));
+    assert.equal(mainLane?.headEntryId, secondAnswer.id, 'main lane head should stay on the original main tail');
+    assert.equal(treeLane?.baseLeafId, baseAnswer.id, 'tree lane should be based at the selected tree leaf');
+    assert.equal(treeLane?.headEntryId, branchAnswer.id, 'tree lane head should advance with the branch response');
   } finally {
     await a.close();
     await b.close();
-    rmSync(root, { recursive: true, force: true });
+    await removeRoot(root);
   }
 });
 
-test('pi-sync keeps a forked tree path on main until an explicit lane switch', { timeout: 120_000 }, async () => {
+test('pi-sync keeps a forked tree path on its auto lane until explicit lane switch', { timeout: 120_000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-sync-alternate-branch-main-'));
   const laneRoot = join(root, 'lane');
   const sessionFile = join(root, 'shared.jsonl');
@@ -318,6 +647,8 @@ export default function treeNavHelper(pi) {
     description: "Navigate to the first message whose text matches args",
     handler: async (args, ctx) => {
       const wanted = args.trim();
+      const file = ctx.sessionManager.getSessionFile();
+      if (file) ctx.sessionManager.setSessionFile(file);
       const entry = ctx.sessionManager.getEntries().find((item) => {
         const content = item.message?.content;
         return Array.isArray(content) && content.some((part) => part.type === "text" && part.text === wanted);
@@ -332,15 +663,16 @@ export default function treeNavHelper(pi) {
   writeFileSync(piWrapper, `#!/usr/bin/env bash\nargs=()\nfor a in "$@"; do [[ "$a" == "--no-session" ]] && continue; args+=("$a"); done\nexec "${process.env.PI_SYNC_TEST_PI_BINARY ?? 'pi'}" "\${args[@]}"\n`);
   chmodSync(piWrapper, 0o755);
 
+  const brain = createControllableBrain();
+  async function respondToPrompt(promptText, responseText) {
+    const call = await brain.waitForCall(TIMEOUT);
+    assert.match(JSON.stringify(call.request), new RegExp(promptText), `expected provider request for ${promptText}`);
+    call.respond(text(responseText));
+  }
+
   const common = {
-    brain: script(
-      text('SYNC_ALT_BASE_ANSWER'),
-      text('SYNC_ALT_MAIN_SECOND_ANSWER'),
-      text('SYNC_ALT_BRANCH_ONE_ANSWER'),
-      text('SYNC_ALT_BRANCH_TWO_ANSWER'),
-      text('SYNC_ALT_MAIN_AFTER_BRANCH_ANSWER'),
-    ),
-    extensions: [PI_LANE_EXT, EXTENSION, helperExt],
+    brain: brain.brain,
+    extensions: [EXTENSION, helperExt],
     piProvider: 'pi-mock',
     piModel: 'mock',
     startupTimeoutMs: 20_000,
@@ -355,50 +687,69 @@ export default function treeNavHelper(pi) {
   const branch = await createInteractiveMock(common);
   try {
     main.submit('SYNC_ALT_BASE_PROMPT');
+    await respondToPrompt('SYNC_ALT_BASE_PROMPT', 'SYNC_ALT_BASE_ANSWER');
     await main.waitForOutput('SYNC_ALT_BASE_ANSWER', TIMEOUT);
     await branch.waitForOutput('SYNC_ALT_BASE_ANSWER', TIMEOUT);
+    await waitForMessageEntry(sessionFile, 'SYNC_ALT_BASE_ANSWER');
 
     main.submit('SYNC_ALT_MAIN_SECOND_PROMPT');
+    await respondToPrompt('SYNC_ALT_MAIN_SECOND_PROMPT', 'SYNC_ALT_MAIN_SECOND_ANSWER');
     await main.waitForOutput('SYNC_ALT_MAIN_SECOND_ANSWER', TIMEOUT);
     await branch.waitForOutput('SYNC_ALT_MAIN_SECOND_ANSWER', TIMEOUT);
+    await waitForMessageEntry(sessionFile, 'SYNC_ALT_MAIN_SECOND_ANSWER');
 
-    branch.submit('/_tree_nav_to_text SYNC_ALT_BASE_ANSWER');
+    const navStart = Date.now();
+    while (Date.now() - navStart < TIMEOUT) {
+      branch.submit('/_tree_nav_to_text SYNC_ALT_BASE_ANSWER');
+      if (await waitUntilQuiet(() => branch.output.includes('leaf_after_nav:'), 5_000)) break;
+      branch.clearOutput();
+    }
     await branch.waitForOutput('leaf_after_nav:', TIMEOUT);
+    branch.submit('/sync status');
+    await branch.waitForOutput(/sync=tree-/, TIMEOUT);
+    main.submit('/sync status');
+    await main.waitForOutput(/sync=main/, TIMEOUT);
 
     main.clearOutput();
     branch.clearOutput();
     branch.submit('SYNC_ALT_BRANCH_ONE_PROMPT');
+    await respondToPrompt('SYNC_ALT_BRANCH_ONE_PROMPT', 'SYNC_ALT_BRANCH_ONE_ANSWER');
     await branch.waitForOutput('SYNC_ALT_BRANCH_ONE_ANSWER', TIMEOUT);
-    await main.waitForOutput('SYNC_ALT_BRANCH_ONE_PROMPT', TIMEOUT);
-    await main.waitForOutput('SYNC_ALT_BRANCH_ONE_ANSWER', TIMEOUT);
-    const sessionKey = stableSessionKey(realpathSync(sessionFile));
-    const laneDir = join(laneRoot, 'sessions', sessionKey, 'lanes');
-    const mainLanePath = join(laneDir, 'main.json');
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    assert.doesNotMatch(main.output, /SYNC_ALT_BRANCH_ONE_PROMPT|SYNC_ALT_BRANCH_ONE_ANSWER/);
+    await waitForMessageEntries(sessionFile, 'SYNC_ALT_BRANCH_ONE_ANSWER');
     await waitUntil(
       () => {
+        const treeLane = readLaneStates(laneRoot).find((item) => item.name?.startsWith('tree-'));
+        if (!treeLane) return false;
         const branchOneAnswers = findMessageEntries(sessionFile, 'SYNC_ALT_BRANCH_ONE_ANSWER');
-        const mainLane = JSON.parse(readFileSync(mainLanePath, 'utf8'));
-        return branchOneAnswers.some((entry) => mainLane.headEntryId === entry.id);
+        return branchOneAnswers.some((entry) => treeLane.headEntryId === entry.id);
       },
       TIMEOUT,
-      'main lane head after first branch prompt',
+      'tree lane head after first branch prompt',
     );
 
     branch.clearOutput();
     branch.submit('SYNC_ALT_BRANCH_TWO_PROMPT');
+    await respondToPrompt('SYNC_ALT_BRANCH_TWO_PROMPT', 'SYNC_ALT_BRANCH_TWO_ANSWER');
     await branch.waitForOutput('SYNC_ALT_BRANCH_TWO_ANSWER', TIMEOUT);
+    await waitForMessageEntries(sessionFile, 'SYNC_ALT_BRANCH_TWO_ANSWER');
     await waitUntil(
       () => {
+        const treeLane = readLaneStates(laneRoot).find((item) => item.name?.startsWith('tree-'));
+        if (!treeLane) return false;
         const branchTwoAnswers = findMessageEntries(sessionFile, 'SYNC_ALT_BRANCH_TWO_ANSWER');
-        const mainLane = JSON.parse(readFileSync(mainLanePath, 'utf8'));
-        return branchTwoAnswers.some((entry) => mainLane.headEntryId === entry.id);
+        return branchTwoAnswers.some((entry) => treeLane.headEntryId === entry.id);
       },
       TIMEOUT,
-      'main lane head after second branch prompt',
+      'tree lane head after second branch prompt',
     );
 
+    main.clearOutput();
     main.submit('SYNC_ALT_MAIN_AFTER_BRANCH_PROMPT');
+    await respondToPrompt('SYNC_ALT_MAIN_AFTER_BRANCH_PROMPT', 'SYNC_ALT_MAIN_AFTER_BRANCH_ANSWER');
     await main.waitForOutput('SYNC_ALT_MAIN_AFTER_BRANCH_ANSWER', TIMEOUT);
+    await waitForMessageEntry(sessionFile, 'SYNC_ALT_MAIN_AFTER_BRANCH_ANSWER');
 
     const baseAnswer = findMessageEntry(sessionFile, 'SYNC_ALT_BASE_ANSWER');
     const mainSecondAnswer = findMessageEntry(sessionFile, 'SYNC_ALT_MAIN_SECOND_ANSWER');
@@ -411,23 +762,108 @@ export default function treeNavHelper(pi) {
 
     assert.equal(branchOnePrompt.parentId, baseAnswer.id, 'first branch prompt should start from selected tree leaf');
     assert.ok(branchOneAnswers.some((entry) => branchTwoPrompt.parentId === entry.id), 'second branch prompt should continue from previous branch answer');
-    assert.ok(branchTwoAnswers.some((entry) => mainAfterBranchPrompt.parentId === entry.id), 'same sync lane should continue from the latest forked main head');
-    assert.notEqual(mainAfterBranchPrompt.parentId, mainSecondAnswer.id, 'tree navigation should not create a hidden branch sync lane');
+    assert.equal(mainAfterBranchPrompt.parentId, mainSecondAnswer.id, 'main lane should continue from the original main tail');
+    assert.ok(branchTwoAnswers.every((entry) => mainAfterBranchPrompt.parentId !== entry.id), 'main lane must not continue from the tree lane');
 
     await waitUntil(
       () => {
+        const mainLanePath = findLaneStatePath(laneRoot);
+        if (!mainLanePath) return false;
         const mainLane = JSON.parse(readFileSync(mainLanePath, 'utf8'));
         return mainLane.headEntryId === mainAfterBranchAnswer.id;
       },
       TIMEOUT,
       'main lane head update',
     );
+    const mainLanePath = findLaneStatePath(laneRoot);
+    assert.ok(mainLanePath, 'expected main lane state file');
     const mainLane = JSON.parse(readFileSync(mainLanePath, 'utf8'));
-    assert.equal(mainLane.headEntryId, mainAfterBranchAnswer.id, 'main lane head should advance along the active forked tree path');
+    assert.equal(mainLane.headEntryId, mainAfterBranchAnswer.id, 'main lane head should advance along the main path');
+    const treeLane = readLaneStates(laneRoot).find((item) => item.name?.startsWith('tree-'));
+    assert.ok(treeLane, 'expected auto tree lane state');
+    assert.ok(branchTwoAnswers.some((entry) => treeLane.headEntryId === entry.id), 'tree lane head should remain on latest tree branch');
     assertNoHiddenBranchLanes(laneRoot);
   } finally {
     await main.close();
     await branch.close();
-    rmSync(root, { recursive: true, force: true });
+    await removeRoot(root);
+  }
+});
+
+test('pi-sync keeps tree lane display ids compact after stale tree aliases', { timeout: 120_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-sync-tree-display-id-'));
+  const laneRoot = join(root, 'lane');
+  const sessionFile = join(root, 'shared.jsonl');
+  const piWrapper = join(root, 'pi-wrapper.sh');
+  const helperExt = join(root, 'tree-nav-helper.mjs');
+  writeFileSync(sessionFile, '', 'utf8');
+  writeFileSync(helperExt, `
+export default function treeNavHelper(pi) {
+  pi.registerCommand("_tree_nav_to_text", {
+    description: "Navigate to the first message whose text matches args",
+    handler: async (args, ctx) => {
+      const wanted = args.trim();
+      const file = ctx.sessionManager.getSessionFile();
+      if (file) ctx.sessionManager.setSessionFile(file);
+      const entry = ctx.sessionManager.getEntries().find((item) => {
+        const content = item.message?.content;
+        return Array.isArray(content) && content.some((part) => part.type === "text" && part.text === wanted);
+      });
+      if (!entry) throw new Error("entry not found: " + wanted);
+      await ctx.navigateTree(entry.id);
+      ctx.ui.notify("leaf_after_nav:" + ctx.sessionManager.getLeafId(), "info");
+    },
+  });
+}
+`, 'utf8');
+  writeFileSync(piWrapper, `#!/usr/bin/env bash\nargs=()\nfor a in "$@"; do [[ "$a" == "--no-session" ]] && continue; args+=("$a"); done\nexec "${process.env.PI_SYNC_TEST_PI_BINARY ?? 'pi'}" "\${args[@]}"\n`);
+  chmodSync(piWrapper, 0o755);
+
+  const mock = await createInteractiveMock({
+    brain: script(
+      text('SYNC_DISPLAY_ONE_ANSWER'),
+      text('SYNC_DISPLAY_TWO_ANSWER'),
+      text('SYNC_DISPLAY_THREE_ANSWER'),
+    ),
+    extensions: [EXTENSION, helperExt],
+    piProvider: 'pi-mock',
+    piModel: 'mock',
+    startupTimeoutMs: 20_000,
+    terminal: { cols: 120, rows: 40 },
+    cwd: root,
+    env: { PI_LANE_ROOT: laneRoot, PI_SYNC_POLL_MS: '25', PI_SYNC_HOST_IDLE_MS: '1000' },
+    piBinary: piWrapper,
+    piArgs: ['--session', sessionFile],
+  });
+
+  try {
+    mock.submit('SYNC_DISPLAY_ONE_PROMPT');
+    await mock.waitForOutput('SYNC_DISPLAY_ONE_ANSWER', TIMEOUT);
+    mock.submit('SYNC_DISPLAY_TWO_PROMPT');
+    await mock.waitForOutput('SYNC_DISPLAY_TWO_ANSWER', TIMEOUT);
+    mock.submit('SYNC_DISPLAY_THREE_PROMPT');
+    await mock.waitForOutput('SYNC_DISPLAY_THREE_ANSWER', TIMEOUT);
+    await waitForMessageEntry(sessionFile, 'SYNC_DISPLAY_THREE_ANSWER');
+
+    mock.clearOutput();
+    mock.submit('/_tree_nav_to_text SYNC_DISPLAY_ONE_ANSWER');
+    await mock.waitForOutput('leaf_after_nav:', TIMEOUT);
+    mock.clearOutput();
+    mock.submit('/lane identity');
+    await mock.waitForOutput(/laneId=L2/, TIMEOUT);
+
+    mock.clearOutput();
+    mock.submit('/lane join main');
+    await mock.waitForOutput(/joined .*main/, TIMEOUT);
+    mock.clearOutput();
+    mock.submit('/_tree_nav_to_text SYNC_DISPLAY_TWO_ANSWER');
+    await mock.waitForOutput('leaf_after_nav:', TIMEOUT);
+    mock.clearOutput();
+    mock.submit('/lane identity');
+    await mock.waitForOutput(/laneId=L2/, TIMEOUT);
+    assert.doesNotMatch(mock.output, /laneId=L3/, mock.output);
+  } finally {
+    await mock.close();
+    await removeRoot(root);
   }
 });

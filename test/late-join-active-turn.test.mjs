@@ -1,11 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, realpathSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createInteractiveMock, createControllableBrain, text } from '../../pi-mock/dist/index.js';
+import { createInteractiveMock, createControllableBrain, streamText, text } from '../../pi-mock/dist/index.js';
 
 const EXTENSION = new URL('../index.ts', import.meta.url).pathname;
+const PI_WORKING = new URL('../../pi-working/index.ts', import.meta.url).pathname;
 const TIMEOUT = 30_000;
 
 function writePiWrapper(root) {
@@ -26,6 +27,25 @@ async function waitUntil(predicate, timeoutMs, label) {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   throw new Error(`timeout waiting for ${label}`);
+}
+
+function workingSeconds(lines) {
+  const text = lines.join('\n');
+  const match = text.match(/Working for (?:(\d+)h )?(?:(\d+)m )?(\d+)s/);
+  if (!match) return undefined;
+  return Number(match[1] ?? 0) * 3600 + Number(match[2] ?? 0) * 60 + Number(match[3] ?? 0);
+}
+
+async function waitForWorkingSeconds(mock, minimum, timeoutMs, label) {
+  let screen = [];
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    screen = await mock.visibleScreen();
+    const seconds = workingSeconds(screen);
+    if (seconds != null && seconds >= minimum) return { seconds, screen };
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`timeout waiting for ${label}\n${screen.join('\n')}`);
 }
 
 async function removeRoot(path) {
@@ -64,6 +84,8 @@ test('pi-sync hydrates a late-joining attached terminal during an active turn', 
   const piWrapper = writePiWrapper(root);
   const brain = createControllableBrain();
   writeFileSync(sessionFile, '', 'utf8');
+  const canonicalSessionFile = realpathSync(sessionFile);
+  const sessionKey = 'late-join-shared-key';
 
   const common = {
     brain: brain.brain,
@@ -73,7 +95,7 @@ test('pi-sync hydrates a late-joining attached terminal during an active turn', 
     startupTimeoutMs: 20_000,
     terminal: { cols: 100, rows: 32 },
     cwd: root,
-    env: { PI_LANE_ROOT: laneRoot, PI_SYNC_POLL_MS: '25', PI_SYNC_HOST_IDLE_MS: '1000' },
+    env: { PI_LANE_ROOT: laneRoot, PI_LANE_SESSION_KEY: sessionKey, PI_LANE_SESSION_FILE: canonicalSessionFile, PI_SYNC_POLL_MS: '25', PI_SYNC_HOST_IDLE_MS: '1000' },
     piBinary: piWrapper,
     piArgs: ['--session', sessionFile],
   };
@@ -108,6 +130,63 @@ test('pi-sync hydrates a late-joining attached terminal during an active turn', 
       `late join must not duplicate persisted user prompts after the active response:\n${afterResponse.join('\n')}`,
     );
     assert.match(b.output, /SYNC_LATE_JOIN_RESPONSE/);
+  } finally {
+    await a.close();
+    if (b) await b.close();
+    await removeRoot(root);
+  }
+});
+
+test('pi-sync late join working timer follows host elapsed time and keeps ticking', { timeout: 90_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-sync-late-join-working-'));
+  const laneRoot = join(root, 'lane');
+  const sessionFile = join(root, 'shared.jsonl');
+  const piWrapper = writePiWrapper(root);
+  const brain = createControllableBrain();
+  writeFileSync(sessionFile, '', 'utf8');
+  const canonicalSessionFile = realpathSync(sessionFile);
+  const sessionKey = 'late-join-working-key';
+
+  const common = {
+    brain: brain.brain,
+    extensions: [EXTENSION, PI_WORKING],
+    piProvider: 'pi-mock',
+    piModel: 'mock',
+    startupTimeoutMs: 20_000,
+    terminal: { cols: 100, rows: 34 },
+    cwd: root,
+    env: { PI_LANE_ROOT: laneRoot, PI_LANE_SESSION_KEY: sessionKey, PI_LANE_SESSION_FILE: canonicalSessionFile, PI_SYNC_POLL_MS: '25', PI_SYNC_HOST_IDLE_MS: '1000' },
+    piBinary: piWrapper,
+    piArgs: ['--session', sessionFile],
+  };
+
+  const a = await createInteractiveMock(common);
+  let b;
+  try {
+    a.clearOutput();
+    a.submit('SYNC_LATE_JOIN_WORKING_PROMPT');
+    const call = await brain.waitForCall(TIMEOUT);
+    ensurePersistedUserPrompt(sessionFile, root, 'SYNC_LATE_JOIN_WORKING_PROMPT');
+    call.respond(streamText([
+      'SYNC_LATE_JOIN_WORKING_CHUNK_1 ',
+      'SYNC_LATE_JOIN_WORKING_CHUNK_2 ',
+      'SYNC_LATE_JOIN_WORKING_CHUNK_3 ',
+      'SYNC_LATE_JOIN_WORKING_CHUNK_4 ',
+      'SYNC_LATE_JOIN_WORKING_DONE',
+    ], 1000));
+    await a.waitForOutput('SYNC_LATE_JOIN_WORKING_CHUNK_1', TIMEOUT);
+    await new Promise((resolve) => setTimeout(resolve, 1600));
+
+    b = await createInteractiveMock(common);
+    await b.waitForOutput('SYNC_LATE_JOIN_WORKING_PROMPT', TIMEOUT);
+    await b.waitForOutput('SYNC_LATE_JOIN_WORKING_CHUNK_1', TIMEOUT);
+
+    const first = await waitForWorkingSeconds(b, 2, TIMEOUT, 'late join working timer to inherit host elapsed time');
+    const second = await waitForWorkingSeconds(b, first.seconds + 1, TIMEOUT, 'late join working timer to keep ticking');
+    assert.ok(
+      second.seconds > first.seconds,
+      `late join working timer must advance\nfirst:\n${first.screen.join('\n')}\nsecond:\n${second.screen.join('\n')}`,
+    );
   } finally {
     await a.close();
     if (b) await b.close();
