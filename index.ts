@@ -639,8 +639,16 @@ export default function piSync(pi: ExtensionAPI) {
       return;
     }
     const messageIds = persistedMessageEntryIds(file);
+    const activeLaneNames = new Set<string>();
+    for (const instance of liveLaneInstances(sessionKey)) {
+      activeLaneNames.add(sanitizeLaneName(instance.lane));
+    }
+    if (currentSessionKey === sessionKey || activeSessionKey === sessionKey) {
+      activeLaneNames.add(sanitizeLaneName(currentLane()));
+    }
     const markers: Record<string, string[]> = {};
     for (const lane of readLaneStates(sessionKey)) {
+      if (!activeLaneNames.has(sanitizeLaneName(lane.name))) continue;
       const headEntryId = lane.headEntryId ?? null;
       if (!headEntryId || !messageIds.has(headEntryId)) continue;
       const id = liveLaneId(sessionKey, lane.name);

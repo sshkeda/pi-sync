@@ -971,6 +971,25 @@ export default function treeNavHelper(pi) {
       ctx.ui.notify("leaf_after_nav:" + ctx.sessionManager.getLeafId(), "info");
     },
   });
+  pi.registerCommand("_tree_markers", {
+    description: "Print pi-sync tree marker env",
+    handler: async (_args, ctx) => {
+      const raw = process.env.PI_SYNC_TREE_MARKERS || "";
+      let readable = "";
+      try {
+        const markers = JSON.parse(raw || "{}");
+        readable = Object.entries(markers).map(([id, label]) => {
+          const entry = ctx.sessionManager.getEntries().find((item) => item.id === id);
+          const content = entry?.message?.content;
+          const text = Array.isArray(content)
+            ? content.filter((part) => part?.type === "text").map((part) => part.text).join("")
+            : "";
+          return label + ":" + text;
+        }).join("|");
+      } catch {}
+      ctx.ui.notify("tree_markers:" + (raw || "<empty>") + " readable:" + readable, "info");
+    },
+  });
 }
 `, 'utf8');
   writeFileSync(piWrapper, `#!/usr/bin/env bash\nargs=()\nfor a in "$@"; do [[ "$a" == "--no-session" ]] && continue; args+=("$a"); done\nexec "${process.env.PI_SYNC_TEST_PI_BINARY ?? 'pi'}" "\${args[@]}"\n`);
@@ -1005,6 +1024,10 @@ export default function treeNavHelper(pi) {
     mock.clearOutput();
     mock.submit('/_tree_nav_to_text SYNC_DISPLAY_ONE_ANSWER');
     await mock.waitForOutput('leaf_after_nav:', TIMEOUT);
+    mock.clearOutput();
+    mock.submit('/_tree_markers');
+    await mock.waitForOutput(/2:SYNC_DISPLAY_ONE_ANSWER/, TIMEOUT);
+    assert.doesNotMatch(mock.output, /1:SYNC_DISPLAY_THREE_ANSWER/, mock.output);
     mock.clearOutput();
     mock.submit('/lane identity');
     await mock.waitForOutput(/laneId=L2/, TIMEOUT);
