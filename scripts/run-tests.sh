@@ -48,6 +48,7 @@ for f in test/*.test.mjs; do
       "alias paths and different peer session ids" \
       "separate sync lane" \
       "forked tree path" \
+      "same-lane session trees" \
       "display ids compact"
     do
       echo "RUN:$f -- $pattern"

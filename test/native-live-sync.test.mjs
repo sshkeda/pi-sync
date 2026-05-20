@@ -177,6 +177,21 @@ async function waitUntilQuiet(predicate, timeoutMs) {
   return false;
 }
 
+async function visibleText(mock) {
+  return (await mock.visibleScreen()).join('\n');
+}
+
+async function waitForVisibleText(mock, matcher, timeoutMs, label) {
+  const start = Date.now();
+  let screen = '';
+  while (Date.now() - start < timeoutMs) {
+    screen = await visibleText(mock);
+    if (typeof matcher === 'string' ? screen.includes(matcher) : matcher.test(screen)) return screen;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`timeout waiting for ${label}\n${screen}`);
+}
+
 async function removeRoot(root) {
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
@@ -786,6 +801,148 @@ export default function treeNavHelper(pi) {
   } finally {
     await main.close();
     await branch.close();
+    await removeRoot(root);
+  }
+});
+
+test('pi-sync keeps same-lane session trees on the shared lane head and marks live lane positions', { timeout: 120_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-sync-tree-head-marker-'));
+  const laneRoot = join(root, 'lane');
+  const sessionFile = join(root, 'shared.jsonl');
+  const piWrapper = join(root, 'pi-wrapper.sh');
+  const helperExt = join(root, 'tree-head-helper.mjs');
+  writeFileSync(sessionFile, '', 'utf8');
+  writeFileSync(helperExt, `
+export default function treeHeadHelper(pi) {
+  pi.registerCommand("_tree_nav_to_text", {
+    description: "Navigate to the first message whose text matches args",
+    handler: async (args, ctx) => {
+      const wanted = args.trim();
+      const file = ctx.sessionManager.getSessionFile();
+      if (file) ctx.sessionManager.setSessionFile(file);
+      const entry = ctx.sessionManager.getEntries().find((item) => {
+        const content = item.message?.content;
+        return Array.isArray(content) && content.some((part) => part.type === "text" && part.text === wanted);
+      });
+      if (!entry) throw new Error("entry not found: " + wanted);
+      await ctx.navigateTree(entry.id);
+      ctx.ui.notify("leaf_after_nav:" + ctx.sessionManager.getLeafId(), "info");
+    },
+  });
+  pi.registerCommand("_leaf_text", {
+    description: "Print the current leaf message text",
+    handler: async (_args, ctx) => {
+      const leafId = ctx.sessionManager.getLeafId();
+      const entry = ctx.sessionManager.getEntries().find((item) => item.id === leafId);
+      const content = entry?.message?.content;
+      const text = Array.isArray(content)
+        ? content.filter((part) => part?.type === "text").map((part) => part.text).join("")
+        : "";
+      ctx.ui.notify("leaf_text:" + text, "info");
+    },
+  });
+  pi.registerCommand("_tree_markers", {
+    description: "Print pi-sync tree marker env",
+    handler: async (_args, ctx) => {
+      const raw = process.env.PI_SYNC_TREE_MARKERS || "";
+      let readable = "";
+      try {
+        const markers = JSON.parse(raw || "{}");
+        readable = Object.entries(markers).map(([id, label]) => {
+          const entry = ctx.sessionManager.getEntries().find((item) => item.id === id);
+          const content = entry?.message?.content;
+          const text = Array.isArray(content)
+            ? content.filter((part) => part?.type === "text").map((part) => part.text).join("")
+            : "";
+          return label + ":" + text;
+        }).join("|");
+      } catch {}
+      ctx.ui.notify("tree_markers:" + (raw || "<empty>") + " readable:" + readable, "info");
+    },
+  });
+}
+`, 'utf8');
+  writeFileSync(piWrapper, `#!/usr/bin/env bash\nargs=()\nfor a in "$@"; do [[ "$a" == "--no-session" ]] && continue; args+=("$a"); done\nexec "${process.env.PI_SYNC_TEST_PI_BINARY ?? 'pi'}" "\${args[@]}"\n`);
+  chmodSync(piWrapper, 0o755);
+
+  const brain = createControllableBrain();
+  async function respondToPrompt(promptText, responseText) {
+    const call = await brain.waitForCall(TIMEOUT);
+    assert.match(JSON.stringify(call.request), new RegExp(promptText), `expected provider request for ${promptText}`);
+    call.respond(text(responseText));
+  }
+
+  const common = {
+    brain: brain.brain,
+    extensions: [EXTENSION, helperExt],
+    piProvider: 'pi-mock',
+    piModel: 'mock',
+    startupTimeoutMs: 20_000,
+    terminal: { cols: 140, rows: 42 },
+    cwd: root,
+    env: { PI_LANE_ROOT: laneRoot, PI_SYNC_POLL_MS: '25', PI_SYNC_HOST_IDLE_MS: '1000' },
+    piBinary: piWrapper,
+    piArgs: ['--session', sessionFile],
+  };
+
+  const a = await createInteractiveMock(common);
+  const b = await createInteractiveMock(common);
+  try {
+    a.submit('SYNC_MARKER_BASE_PROMPT');
+    await respondToPrompt('SYNC_MARKER_BASE_PROMPT', 'SYNC_MARKER_BASE_ANSWER');
+    await a.waitForOutput('SYNC_MARKER_BASE_ANSWER', TIMEOUT);
+    await b.waitForOutput('SYNC_MARKER_BASE_ANSWER', TIMEOUT);
+
+    a.submit('SYNC_MARKER_MAIN_PROMPT');
+    await respondToPrompt('SYNC_MARKER_MAIN_PROMPT', 'SYNC_MARKER_MAIN_ANSWER');
+    await a.waitForOutput('SYNC_MARKER_MAIN_ANSWER', TIMEOUT);
+    await b.waitForOutput('SYNC_MARKER_MAIN_ANSWER', TIMEOUT);
+    await waitForMessageEntry(sessionFile, 'SYNC_MARKER_MAIN_ANSWER');
+
+    b.submit('/_tree_nav_to_text SYNC_MARKER_BASE_ANSWER');
+    await b.waitForOutput('leaf_after_nav:', TIMEOUT);
+    b.submit('/lane status');
+    await b.waitForOutput(/current 2 \(tree-/, TIMEOUT);
+
+    a.submit('/lane join 2');
+    await a.waitForOutput(/joined 2 \(tree-/, TIMEOUT);
+    a.clearOutput();
+    a.submit('/_leaf_text');
+    await a.waitForOutput('leaf_text:SYNC_MARKER_BASE_ANSWER', TIMEOUT);
+
+    a.clearOutput();
+    b.clearOutput();
+    b.submit('SYNC_MARKER_BRANCH_PROMPT');
+    await respondToPrompt('SYNC_MARKER_BRANCH_PROMPT', 'SYNC_MARKER_BRANCH_ANSWER');
+    await b.waitForOutput('SYNC_MARKER_BRANCH_ANSWER', TIMEOUT);
+    await a.waitForOutput('SYNC_MARKER_BRANCH_ANSWER', TIMEOUT);
+    await waitForMessageEntry(sessionFile, 'SYNC_MARKER_BRANCH_ANSWER');
+
+    a.clearOutput();
+    a.submit('/_leaf_text');
+    await a.waitForOutput('leaf_text:SYNC_MARKER_BRANCH_ANSWER', TIMEOUT);
+
+    b.clearOutput();
+    b.submit('/_leaf_text');
+    await b.waitForOutput('leaf_text:SYNC_MARKER_BRANCH_ANSWER', TIMEOUT);
+
+    a.clearOutput();
+    a.submit('/_tree_markers');
+    await a.waitForOutput('tree_markers:', TIMEOUT);
+    assert.doesNotMatch(a.output, /tree_markers:<empty>/, a.output);
+    assert.match(a.output, /2:SYNC_MARKER_BRANCH_ANSWER/, a.output);
+
+    a.clearOutput();
+    b.clearOutput();
+    a.submit('/tree');
+    b.submit('/tree');
+    const screenA = await waitForVisibleText(a, /›\s+2[\s\S]*•\s+assistant:\s+SYNC_MARKER_BRANCH_ANSWER/, TIMEOUT, 'terminal A selected tree head marker');
+    const screenB = await waitForVisibleText(b, /›\s+2[\s\S]*•\s+assistant:\s+SYNC_MARKER_BRANCH_ANSWER/, TIMEOUT, 'terminal B selected tree head marker');
+    assert.doesNotMatch(screenA, /›\s+1[\s\S]*•\s+assistant:\s+SYNC_MARKER_BRANCH_ANSWER/, screenA);
+    assert.doesNotMatch(screenB, /›\s+1[\s\S]*•\s+assistant:\s+SYNC_MARKER_BRANCH_ANSWER/, screenB);
+  } finally {
+    await a.close();
+    await b.close();
     await removeRoot(root);
   }
 });

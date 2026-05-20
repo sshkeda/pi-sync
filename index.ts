@@ -254,6 +254,21 @@ function persistedEntryExists(path: string | undefined, entryId: string): boolea
   return false;
 }
 
+function persistedMessageEntryIds(path: string | undefined): Set<string> {
+  const ids = new Set<string>();
+  if (!path || !existsSync(path)) return ids;
+  try {
+    const lines = readFileSync(path, "utf8").trim().split(/\r?\n/).filter(Boolean);
+    for (const line of lines) {
+      const entry = JSON.parse(line) as { type?: string; id?: unknown };
+      if (entry.type === "message" && typeof entry.id === "string") ids.add(entry.id);
+    }
+  } catch {
+    ids.clear();
+  }
+  return ids;
+}
+
 function extractMessageText(message: any): string | undefined {
   if (!message) return undefined;
   if (typeof message.content === "string") return message.content;
@@ -611,10 +626,68 @@ export default function piSync(pi: ExtensionAPI) {
     delete process.env.PI_LANE_CURRENT_LANE_ID;
     delete process.env.PI_LANE_CURRENT_LANE_FILE_ID;
     delete process.env.PI_LANE_CURRENT_LANE_FILE;
+    delete process.env.PI_SYNC_TREE_MARKERS;
     if (initialSyncRootEnv === undefined) delete process.env.PI_SYNC_ROOT;
     else process.env.PI_SYNC_ROOT = initialSyncRootEnv;
     if (initialLaneRootEnv === undefined) delete process.env.PI_LANE_ROOT;
     else process.env.PI_LANE_ROOT = initialLaneRootEnv;
+  }
+
+  function updateTreeMarkers(sessionKey: string | undefined = currentSessionKey ?? activeSessionKey, file: string | undefined = currentSessionFile ?? activeSessionFile): void {
+    if (!sessionKey || !file) {
+      delete process.env.PI_SYNC_TREE_MARKERS;
+      return;
+    }
+    const messageIds = persistedMessageEntryIds(file);
+    const markers: Record<string, string[]> = {};
+    for (const lane of readLaneStates(sessionKey)) {
+      const headEntryId = lane.headEntryId ?? null;
+      if (!headEntryId || !messageIds.has(headEntryId)) continue;
+      const id = liveLaneId(sessionKey, lane.name);
+      markers[headEntryId] = [...(markers[headEntryId] ?? []), id];
+    }
+    const compactMarkers: Record<string, string> = {};
+    for (const [entryId, ids] of Object.entries(markers)) {
+      compactMarkers[entryId] = [...new Set(ids)]
+        .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
+        .join(",");
+    }
+    if (Object.keys(compactMarkers).length > 0) {
+      process.env.PI_SYNC_TREE_MARKERS = JSON.stringify(compactMarkers);
+    } else {
+      delete process.env.PI_SYNC_TREE_MARKERS;
+    }
+  }
+
+  function syncSessionLeafToLaneHead(ctx: ExtensionContext, sessionKey: string | undefined = activeSessionKey, laneName: string = activeLane ?? currentLane()): void {
+    if (!sessionKey || !activeSessionFile) return;
+    const lane = readLane(sessionKey, laneName);
+    if (!lane) return;
+    const targetHead = lane.headEntryId ?? null;
+    const sm = sessionManager(ctx);
+    if (!sm) return;
+    const currentLeaf = sm.getLeafId?.() ?? null;
+    if (currentLeaf === targetHead) {
+      selectedTreeCursorEntryId = targetHead;
+      updateTreeMarkers(sessionKey, activeSessionFile);
+      return;
+    }
+    try {
+      sm.setSessionFile?.(activeSessionFile);
+      if (targetHead === null) {
+        sm.resetLeaf?.();
+      } else if (persistedEntryExists(activeSessionFile, targetHead)) {
+        sm.branch?.(targetHead);
+      } else {
+        return;
+      }
+      selectedTreeCursorEntryId = targetHead;
+      updateTreeMarkers(sessionKey, activeSessionFile);
+      (ctx.ui as any)?.requestRender?.();
+    } catch {
+      // Best-effort reconciliation. The next session refresh or tree
+      // navigation will retry with the latest persisted lane state.
+    }
   }
 
   function writeLaneInstance(ctx: ExtensionContext, file: string, status = currentStatus): void {
@@ -634,6 +707,7 @@ export default function piSync(pi: ExtensionAPI) {
       lastSeenAt: nowIso(),
     };
     writeJsonFile(instancePath(currentSessionKey, instanceId), state);
+    updateTreeMarkers(currentSessionKey, file);
   }
 
   function readLaneInstances(sessionKey: string): InstanceState[] {
@@ -865,6 +939,7 @@ export default function piSync(pi: ExtensionAPI) {
       instanceId,
     });
     writeLaneInstance(ctx, file, "idle");
+    updateTreeMarkers(key, file);
   }
 
   function ensureHost(ctx: ExtensionContext): void {
@@ -988,6 +1063,9 @@ export default function piSync(pi: ExtensionAPI) {
     }
     if (event.type === "session_flushed" || event.type === "lane_head_updated" || event.type === "prompt_end" || event.type === "prompt_error") {
       refreshSessionFile(ctx);
+      if (event.type === "lane_head_updated" || event.type === "session_flushed" || event.type === "prompt_end") {
+        syncSessionLeafToLaneHead(ctx);
+      }
       remoteTurnMaybeUnflushed = false;
       return;
     }
@@ -1455,6 +1533,7 @@ export default function piSync(pi: ExtensionAPI) {
     activeEventPath = eventLogPath(activeSessionKey, activeLane);
     ensureLane(activeSessionKey, file, activeLane, persistedLeafId(file) ?? sessionManager(ctx)?.getLeafId?.() ?? null);
     exportLaneIdentity(ctx, file);
+    updateTreeMarkers(activeSessionKey, file);
     mkdirSync(syncDir(activeSessionKey, activeLane), { recursive: true });
     if (!existsSync(activeEventPath)) writeFileSync(activeEventPath, "", "utf8");
     return true;

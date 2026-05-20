@@ -76,5 +76,56 @@
         "reason": "Provides TypeScript surface for the native UI replay hook and extension replay option."
       }
     ]
+  },
+  {
+    "id": "070-tree-selector-live-markers",
+    "file": "dist/modes/interactive/components/tree-selector.js",
+    "intent": "Render non-persistent live tree markers from PI_SYNC_TREE_MARKERS before the active-path dot so synced terminals can show where live pi-sync lanes are pointed without writing labels into the session.",
+    "find": "        const startIndex = Math.max(0, Math.min(this.selectedIndex - Math.floor(this.maxVisibleLines / 2), this.filteredNodes.length - this.maxVisibleLines));\n        const endIndex = Math.min(startIndex + this.maxVisibleLines, this.filteredNodes.length);\n        for (let i = startIndex; i < endIndex; i++) {",
+    "replace": "        const startIndex = Math.max(0, Math.min(this.selectedIndex - Math.floor(this.maxVisibleLines / 2), this.filteredNodes.length - this.maxVisibleLines));\n        const endIndex = Math.min(startIndex + this.maxVisibleLines, this.filteredNodes.length);\n        let liveMarkers = {};\n        try {\n            liveMarkers = JSON.parse(process.env.PI_SYNC_TREE_MARKERS || \"{}\");\n        }\n        catch { }\n        for (let i = startIndex; i < endIndex; i++) {",
+    "verify": "liveMarkers = JSON.parse(process.env.PI_SYNC_TREE_MARKERS || \"{}\");",
+    "occurrences": 1,
+    "references": [
+      {
+        "type": "consumer-repo",
+        "repo": "pi-sync",
+        "paths": ["index.ts", "test/native-live-sync.test.mjs"],
+        "reason": "pi-sync exports ephemeral live lane-head markers for the tree selector; this keeps lane position debugging visible while avoiding persistent label entries or sync-specific transcript UI."
+      }
+    ]
+  },
+  {
+    "id": "071-tree-selector-live-marker-line",
+    "file": "dist/modes/interactive/components/tree-selector.js",
+    "intent": "Place the live pi-sync lane marker between the cursor/prefix and active-path dot in each session-tree row.",
+    "find": "            const pathMarker = isOnActivePath ? theme.fg(\"accent\", \"• \") : \"\";\n            const label = flatNode.node.label ? theme.fg(\"warning\", `[${flatNode.node.label}] `) : \"\";\n            const labelTimestamp = this.showLabelTimestamps && flatNode.node.label && flatNode.node.labelTimestamp\n                ? theme.fg(\"muted\", `${this.formatLabelTimestamp(flatNode.node.labelTimestamp)} `)\n                : \"\";\n            const content = this.getEntryDisplayText(flatNode.node, isSelected);\n            let line = cursor + theme.fg(\"dim\", prefix) + foldMarker + pathMarker + label + labelTimestamp + content;",
+    "replace": "            const pathMarker = isOnActivePath ? theme.fg(\"accent\", \"• \") : \"\";\n            const liveMarkerValue = liveMarkers && typeof liveMarkers === \"object\" && typeof liveMarkers[entry.id] === \"string\" ? liveMarkers[entry.id] : \"\";\n            const liveMarker = liveMarkerValue ? theme.fg(\"dim\", `${liveMarkerValue} `) : \"\";\n            const label = flatNode.node.label ? theme.fg(\"warning\", `[${flatNode.node.label}] `) : \"\";\n            const labelTimestamp = this.showLabelTimestamps && flatNode.node.label && flatNode.node.labelTimestamp\n                ? theme.fg(\"muted\", `${this.formatLabelTimestamp(flatNode.node.labelTimestamp)} `)\n                : \"\";\n            const content = this.getEntryDisplayText(flatNode.node, isSelected);\n            let line = cursor + theme.fg(\"dim\", prefix) + foldMarker + liveMarker + pathMarker + label + labelTimestamp + content;",
+    "verify": "const liveMarker = liveMarkerValue ? theme.fg(\"dim\", `${liveMarkerValue} `) : \"\";",
+    "occurrences": 1,
+    "references": [
+      {
+        "type": "consumer-repo",
+        "repo": "pi-sync",
+        "paths": ["index.ts", "test/native-live-sync.test.mjs"],
+        "reason": "Shows live sync lane labels at their current tree heads, e.g. `› 2 • assistant`, so users can see where other attached terminals are pointed."
+      }
+    ]
+  },
+  {
+    "id": "072-tree-selector-live-marker-before-indent",
+    "file": "dist/modes/interactive/components/tree-selector.js",
+    "intent": "Render the live pi-sync lane marker directly after the selector cursor, before tree indentation, so nested tree rows still show lane position next to `›`.",
+    "find": "            let line = cursor + theme.fg(\"dim\", prefix) + foldMarker + liveMarker + pathMarker + label + labelTimestamp + content;",
+    "replace": "            let line = cursor + liveMarker + theme.fg(\"dim\", prefix) + foldMarker + pathMarker + label + labelTimestamp + content;",
+    "verify": "let line = cursor + liveMarker + theme.fg(\"dim\", prefix) + foldMarker + pathMarker + label + labelTimestamp + content;",
+    "occurrences": 1,
+    "references": [
+      {
+        "type": "consumer-repo",
+        "repo": "pi-sync",
+        "paths": ["index.ts", "test/native-live-sync.test.mjs"],
+        "reason": "Keeps live lane markers visible beside the tree cursor even for deeply nested branch rows."
+      }
+    ]
   }
 ]
