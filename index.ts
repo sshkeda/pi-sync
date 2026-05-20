@@ -269,6 +269,20 @@ function persistedMessageEntryIds(path: string | undefined): Set<string> {
   return ids;
 }
 
+function persistedRootMarkerEntryId(path: string | undefined): string | undefined {
+  if (!path || !existsSync(path)) return undefined;
+  try {
+    const lines = readFileSync(path, "utf8").trim().split(/\r?\n/).filter(Boolean);
+    for (const line of lines) {
+      const entry = JSON.parse(line) as { type?: string; id?: unknown; parentId?: unknown };
+      if (entry.type === "message" && typeof entry.id === "string" && entry.parentId == null) return entry.id;
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
 function extractMessageText(message: any): string | undefined {
   if (!message) return undefined;
   if (typeof message.content === "string") return message.content;
@@ -651,9 +665,14 @@ export default function piSync(pi: ExtensionAPI) {
     for (const lane of readLaneStates(sessionKey)) {
       if (!activeLaneNames.has(sanitizeLaneName(lane.name))) continue;
       const headEntryId = lane.headEntryId ?? null;
-      if (!headEntryId || !messageIds.has(headEntryId)) continue;
+      const markerEntryId = headEntryId && messageIds.has(headEntryId)
+        ? headEntryId
+        : headEntryId === null
+          ? persistedRootMarkerEntryId(file)
+          : undefined;
+      if (!markerEntryId) continue;
       const id = liveLaneId(sessionKey, lane.name);
-      markers[headEntryId] = [...(markers[headEntryId] ?? []), id];
+      markers[markerEntryId] = [...(markers[markerEntryId] ?? []), id];
     }
     const compactMarkers: Record<string, string> = {};
     for (const [entryId, ids] of Object.entries(markers)) {

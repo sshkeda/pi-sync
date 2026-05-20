@@ -585,7 +585,7 @@ export default function treeNavHelper(pi) {
       if (file) ctx.sessionManager.setSessionFile(file);
       const entry = ctx.sessionManager.getEntries().find((item) => {
         const content = item.message?.content;
-        return Array.isArray(content) && content.some((part) => part.type === "text" && part.text === wanted);
+        return content === wanted || (Array.isArray(content) && content.some((part) => part.type === "text" && part.text === wanted));
       });
       if (!entry) throw new Error("entry not found: " + wanted);
       await ctx.navigateTree(entry.id);
@@ -1266,6 +1266,76 @@ test('pi-sync marks the current single-lane assistant row in the session tree', 
     const selectedAssistant = await waitForVisibleLine(mock, 'assistant: SYNC_CURRENT_TREE_MARKER_ANSWER', TIMEOUT, 'current assistant tree marker');
     assert.match(selectedAssistant.line, /\b1\b/, selectedAssistant.screen);
     assert.doesNotMatch(selectedAssistant.line, /\b2\b/, selectedAssistant.screen);
+  } finally {
+    await mock.close();
+    await removeRoot(root);
+  }
+});
+
+test('pi-sync marks a root-position lane on the first root message row', { timeout: 90_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-sync-root-tree-marker-'));
+  const laneRoot = join(root, 'lane');
+  const sessionFile = join(root, 'shared.jsonl');
+  const piWrapper = join(root, 'pi-wrapper.sh');
+  const helperExt = join(root, 'tree-root-helper.mjs');
+  writeFileSync(sessionFile, [
+    JSON.stringify({ type: 'session', version: 3, id: 'root-marker-session', timestamp: new Date().toISOString(), cwd: root }),
+    JSON.stringify({ type: 'message', id: 'root-user-entry', parentId: null, timestamp: new Date().toISOString(), message: { role: 'user', content: [{ type: 'text', text: 'SYNC_ROOT_TREE_MARKER_PROMPT' }] } }),
+    JSON.stringify({ type: 'message', id: 'root-assistant-entry', parentId: 'root-user-entry', timestamp: new Date().toISOString(), message: { role: 'assistant', content: [{ type: 'text', text: 'SYNC_ROOT_TREE_MARKER_ANSWER' }], stopReason: 'stop', usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }),
+    '',
+  ].join('\n'), 'utf8');
+  writeFileSync(helperExt, `
+export default function rootTreeHelper(pi) {
+  pi.registerCommand("_tree_nav_to_text", {
+    description: "Navigate to the first message whose text matches args",
+    handler: async (args, ctx) => {
+      const wanted = args.trim();
+      const file = ctx.sessionManager.getSessionFile();
+      if (file) ctx.sessionManager.setSessionFile(file);
+      const entry = ctx.sessionManager.getEntries().find((item) => {
+        const content = item.message?.content;
+        return Array.isArray(content) && content.some((part) => part.type === "text" && part.text === wanted);
+      });
+      if (!entry) throw new Error("entry not found: " + wanted);
+      await ctx.navigateTree(entry.id);
+      ctx.ui.notify("leaf_after_nav:" + (ctx.sessionManager.getLeafId() ?? "<root>"), "info");
+    },
+  });
+}
+`, 'utf8');
+  writeFileSync(piWrapper, `#!/usr/bin/env bash\nargs=()\nfor a in "$@"; do [[ "$a" == "--no-session" ]] && continue; args+=("$a"); done\nexec "${process.env.PI_SYNC_TEST_PI_BINARY ?? 'pi'}" "\${args[@]}"\n`);
+  chmodSync(piWrapper, 0o755);
+
+  const mock = await createInteractiveMock({
+    brain: script(text('UNUSED_ROOT_MARKER_RESPONSE')),
+    extensions: [EXTENSION, helperExt],
+    piProvider: 'pi-mock',
+    piModel: 'mock',
+    startupTimeoutMs: 20_000,
+    terminal: { cols: 120, rows: 34 },
+    cwd: root,
+    env: { PI_LANE_ROOT: laneRoot, PI_SYNC_POLL_MS: '25', PI_SYNC_HOST_IDLE_MS: '1000' },
+    piBinary: piWrapper,
+    piArgs: ['--session', sessionFile],
+  });
+
+  try {
+    await mock.waitForOutput('SYNC_ROOT_TREE_MARKER_ANSWER', TIMEOUT);
+
+    mock.clearOutput();
+    mock.submit('/_tree_nav_to_text SYNC_ROOT_TREE_MARKER_PROMPT');
+    await waitUntil(
+      () => readLaneStates(laneRoot).some((lane) => lane.name === 'tree-root' && lane.headEntryId === null),
+      TIMEOUT,
+      'root lane state after navigating to first user message',
+    );
+    mock.clearOutput();
+    mock.sendKey('ctrl+c');
+    mock.clearOutput();
+    mock.submit('/tree');
+    const rootUser = await waitForVisibleLine(mock, 'user: SYNC_ROOT_TREE_MARKER_PROMPT', TIMEOUT, 'root lane marker on first root row');
+    assert.match(rootUser.line, /\b1\b/, rootUser.screen);
+    assert.doesNotMatch(rootUser.line, /\b2\b/, rootUser.screen);
   } finally {
     await mock.close();
     await removeRoot(root);
