@@ -171,7 +171,7 @@ async function waitUntil(predicate, timeoutMs, label) {
 async function waitUntilQuiet(predicate, timeoutMs) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    if (predicate()) return true;
+    if (await predicate()) return true;
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   return false;
@@ -190,6 +190,10 @@ async function waitForVisibleText(mock, matcher, timeoutMs, label) {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   throw new Error(`timeout waiting for ${label}\n${screen}`);
+}
+
+function lineContaining(screen, needle) {
+  return screen.split('\n').find((line) => line.includes(needle)) ?? '';
 }
 
 async function removeRoot(root) {
@@ -1029,12 +1033,30 @@ export default function treeNavHelper(pi) {
     await mock.waitForOutput(/2:SYNC_DISPLAY_ONE_ANSWER/, TIMEOUT);
     assert.doesNotMatch(mock.output, /1:SYNC_DISPLAY_THREE_ANSWER/, mock.output);
     mock.clearOutput();
+    mock.submit('/tree');
+    const treeOnLane2 = await waitForVisibleText(mock, 'SYNC_DISPLAY_ONE_ANSWER', TIMEOUT, 'visible tree marker on lane 2 head');
+    assert.match(lineContaining(treeOnLane2, 'assistant: SYNC_DISPLAY_ONE_ANSWER'), /\b2\b/, treeOnLane2);
+    assert.doesNotMatch(lineContaining(treeOnLane2, 'assistant: SYNC_DISPLAY_THREE_ANSWER'), /\b1\b/);
+    mock.sendKey('escape');
+    await waitUntilQuiet(async () => !(await visibleText(mock)).includes('Session Tree'), TIMEOUT);
+    mock.clearOutput();
     mock.submit('/lane identity');
     await mock.waitForOutput(/laneId=L2/, TIMEOUT);
 
     mock.clearOutput();
     mock.submit('/lane join main');
     await mock.waitForOutput(/joined .*main/, TIMEOUT);
+    mock.clearOutput();
+    mock.submit('/_tree_markers');
+    await mock.waitForOutput(/1:SYNC_DISPLAY_THREE_ANSWER/, TIMEOUT);
+    assert.doesNotMatch(mock.output, /2:SYNC_DISPLAY_ONE_ANSWER/, mock.output);
+    mock.clearOutput();
+    mock.submit('/tree');
+    const treeBackOnMain = await waitForVisibleText(mock, 'SYNC_DISPLAY_THREE_ANSWER', TIMEOUT, 'visible tree marker after joining main');
+    assert.match(lineContaining(treeBackOnMain, 'assistant: SYNC_DISPLAY_THREE_ANSWER'), /\b1\b/, treeBackOnMain);
+    assert.doesNotMatch(lineContaining(treeBackOnMain, 'assistant: SYNC_DISPLAY_ONE_ANSWER'), /\b2\b/);
+    mock.sendKey('escape');
+    await waitUntilQuiet(async () => !(await visibleText(mock)).includes('Session Tree'), TIMEOUT);
     mock.clearOutput();
     mock.submit('/_tree_nav_to_text SYNC_DISPLAY_TWO_ANSWER');
     await mock.waitForOutput('leaf_after_nav:', TIMEOUT);
@@ -1044,6 +1066,148 @@ export default function treeNavHelper(pi) {
     assert.doesNotMatch(mock.output, /laneId=L3/, mock.output);
   } finally {
     await mock.close();
+    await removeRoot(root);
+  }
+});
+
+test('pi-sync removes visible tree markers for disconnected lanes', { timeout: 120_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-sync-tree-marker-disconnect-'));
+  const laneRoot = join(root, 'lane');
+  const sessionFile = join(root, 'shared.jsonl');
+  const piWrapper = join(root, 'pi-wrapper.sh');
+  const helperExt = join(root, 'tree-nav-helper.mjs');
+  writeFileSync(sessionFile, '', 'utf8');
+  writeFileSync(helperExt, `
+export default function treeNavHelper(pi) {
+  pi.registerCommand("_tree_nav_to_text", {
+    description: "Navigate to the first message whose text matches args",
+    handler: async (args, ctx) => {
+      const wanted = args.trim();
+      const file = ctx.sessionManager.getSessionFile();
+      if (file) ctx.sessionManager.setSessionFile(file);
+      const entry = ctx.sessionManager.getEntries().find((item) => {
+        const content = item.message?.content;
+        return Array.isArray(content) && content.some((part) => part.type === "text" && part.text === wanted);
+      });
+      if (!entry) throw new Error("entry not found: " + wanted);
+      await ctx.navigateTree(entry.id);
+      ctx.ui.notify("leaf_after_nav:" + ctx.sessionManager.getLeafId(), "info");
+    },
+  });
+}
+`, 'utf8');
+  writeFileSync(piWrapper, `#!/usr/bin/env bash\nargs=()\nfor a in "$@"; do [[ "$a" == "--no-session" ]] && continue; args+=("$a"); done\nexec "${process.env.PI_SYNC_TEST_PI_BINARY ?? 'pi'}" "\${args[@]}"\n`);
+  chmodSync(piWrapper, 0o755);
+
+  const common = {
+    brain: script(
+      text('SYNC_DISCONNECT_BASE_ANSWER'),
+      text('SYNC_DISCONNECT_MAIN_ANSWER'),
+    ),
+    extensions: [EXTENSION, helperExt],
+    piProvider: 'pi-mock',
+    piModel: 'mock',
+    startupTimeoutMs: 20_000,
+    terminal: { cols: 140, rows: 42 },
+    cwd: root,
+    env: {
+      PI_LANE_ROOT: laneRoot,
+      PI_SYNC_POLL_MS: '25',
+      PI_SYNC_HOST_IDLE_MS: '1000',
+      PI_SYNC_INSTANCE_STALE_MS: '250',
+      PI_LANE_HEARTBEAT_MS: '250',
+    },
+    piBinary: piWrapper,
+    piArgs: ['--session', sessionFile],
+  };
+
+  const main = await createInteractiveMock(common);
+  const branch = await createInteractiveMock(common);
+  try {
+    main.submit('SYNC_DISCONNECT_BASE_PROMPT');
+    await main.waitForOutput('SYNC_DISCONNECT_BASE_ANSWER', TIMEOUT);
+    await branch.waitForOutput('SYNC_DISCONNECT_BASE_ANSWER', TIMEOUT);
+    main.submit('SYNC_DISCONNECT_MAIN_PROMPT');
+    await main.waitForOutput('SYNC_DISCONNECT_MAIN_ANSWER', TIMEOUT);
+    await branch.waitForOutput('SYNC_DISCONNECT_MAIN_ANSWER', TIMEOUT);
+    await waitForMessageEntry(sessionFile, 'SYNC_DISCONNECT_MAIN_ANSWER');
+
+    branch.submit('/_tree_nav_to_text SYNC_DISCONNECT_BASE_ANSWER');
+    await branch.waitForOutput('leaf_after_nav:', TIMEOUT);
+    branch.clearOutput();
+    branch.submit('/tree');
+    const withPeer = await waitForVisibleText(branch, 'SYNC_DISCONNECT_MAIN_ANSWER', TIMEOUT, 'tree marker while main peer is live');
+    assert.match(lineContaining(withPeer, 'assistant: SYNC_DISCONNECT_BASE_ANSWER'), /\b2\b/, withPeer);
+    assert.match(lineContaining(withPeer, 'assistant: SYNC_DISCONNECT_MAIN_ANSWER'), /\b1\b/, withPeer);
+    branch.sendKey('escape');
+    await waitUntilQuiet(async () => !(await visibleText(branch)).includes('Session Tree'), TIMEOUT);
+
+    await main.close();
+    await new Promise((resolve) => setTimeout(resolve, 800));
+
+    branch.clearOutput();
+    branch.submit('/tree');
+    const withoutPeer = await waitForVisibleText(branch, 'SYNC_DISCONNECT_MAIN_ANSWER', TIMEOUT, 'tree marker after main peer disconnects');
+    assert.match(lineContaining(withoutPeer, 'assistant: SYNC_DISCONNECT_BASE_ANSWER'), /\b2\b/, withoutPeer);
+    assert.doesNotMatch(lineContaining(withoutPeer, 'assistant: SYNC_DISCONNECT_MAIN_ANSWER'), /\b1\b/);
+  } finally {
+    await main.close();
+    await branch.close();
+    await removeRoot(root);
+  }
+});
+
+test('pi-sync refreshes an open session tree when a same-lane peer advances', { timeout: 120_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-sync-open-tree-refresh-'));
+  const laneRoot = join(root, 'lane');
+  const sessionFile = join(root, 'shared.jsonl');
+  const piWrapper = join(root, 'pi-wrapper.sh');
+  writeFileSync(sessionFile, '', 'utf8');
+  writeFileSync(piWrapper, `#!/usr/bin/env bash\nargs=()\nfor a in "$@"; do [[ "$a" == "--no-session" ]] && continue; args+=("$a"); done\nexec "${process.env.PI_SYNC_TEST_PI_BINARY ?? 'pi'}" "\${args[@]}"\n`);
+  chmodSync(piWrapper, 0o755);
+
+  const brain = createControllableBrain();
+  async function respondToPrompt(promptText, responseText) {
+    const call = await brain.waitForCall(TIMEOUT);
+    assert.match(JSON.stringify(call.request), new RegExp(promptText), `expected provider request for ${promptText}`);
+    call.respond(text(responseText));
+  }
+
+  const common = {
+    brain: brain.brain,
+    extensions: [EXTENSION],
+    piProvider: 'pi-mock',
+    piModel: 'mock',
+    startupTimeoutMs: 20_000,
+    terminal: { cols: 140, rows: 42 },
+    cwd: root,
+    env: { PI_LANE_ROOT: laneRoot, PI_SYNC_POLL_MS: '25', PI_SYNC_HOST_IDLE_MS: '1000' },
+    piBinary: piWrapper,
+    piArgs: ['--session', sessionFile],
+  };
+
+  const watcher = await createInteractiveMock(common);
+  const submitter = await createInteractiveMock(common);
+  try {
+    submitter.submit('SYNC_OPEN_TREE_BASE_PROMPT');
+    await respondToPrompt('SYNC_OPEN_TREE_BASE_PROMPT', 'SYNC_OPEN_TREE_BASE_ANSWER');
+    await watcher.waitForOutput('SYNC_OPEN_TREE_BASE_ANSWER', TIMEOUT);
+    await waitForMessageEntry(sessionFile, 'SYNC_OPEN_TREE_BASE_ANSWER');
+
+    watcher.clearOutput();
+    watcher.submit('/tree');
+    await waitForVisibleText(watcher, 'SYNC_OPEN_TREE_BASE_ANSWER', TIMEOUT, 'open tree before peer advances');
+
+    submitter.submit('SYNC_OPEN_TREE_NEXT_PROMPT');
+    await respondToPrompt('SYNC_OPEN_TREE_NEXT_PROMPT', 'SYNC_OPEN_TREE_NEXT_ANSWER');
+    await submitter.waitForOutput('SYNC_OPEN_TREE_NEXT_ANSWER', TIMEOUT);
+    await waitForMessageEntry(sessionFile, 'SYNC_OPEN_TREE_NEXT_ANSWER');
+
+    const refreshedTree = await waitForVisibleText(watcher, 'SYNC_OPEN_TREE_NEXT_ANSWER', TIMEOUT, 'open tree refresh after peer advances');
+    assert.match(lineContaining(refreshedTree, 'assistant: SYNC_OPEN_TREE_NEXT_ANSWER'), /\b1\b/, refreshedTree);
+  } finally {
+    await watcher.close();
+    await submitter.close();
     await removeRoot(root);
   }
 });

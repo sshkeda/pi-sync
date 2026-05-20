@@ -49,6 +49,8 @@ for f in test/*.test.mjs; do
       "separate sync lane" \
       "forked tree path" \
       "same-lane session trees" \
+      "disconnected lanes" \
+      "open session tree" \
       "display ids compact"
     do
       echo "RUN:$f -- $pattern"

@@ -127,5 +127,73 @@
         "reason": "Keeps live lane markers visible beside the tree cursor even for deeply nested branch rows."
       }
     ]
+  },
+  {
+    "id": "073-tree-selector-live-tree-provider-state",
+    "file": "dist/modes/interactive/components/tree-selector.js",
+    "intent": "Allow TreeList to receive an optional live tree provider so an already-open session tree can refresh when another same-session terminal advances the session.",
+    "find": "    foldedNodes = new Set();\n    onSelect;\n    onCancel;\n    onLabelEdit;\n    constructor(tree, currentLeafId, maxVisibleLines, initialSelectedId, initialFilterMode) {\n        this.currentLeafId = currentLeafId;",
+    "replace": "    foldedNodes = new Set();\n    onSelect;\n    onCancel;\n    onLabelEdit;\n    treeProvider;\n    treeRevision = \"\";\n    constructor(tree, currentLeafId, maxVisibleLines, initialSelectedId, initialFilterMode, treeProvider) {\n        this.treeProvider = treeProvider;\n        this.currentLeafId = currentLeafId;",
+    "verify": "treeProvider;\n    treeRevision = \"\";",
+    "occurrences": 1,
+    "references": [
+      {
+        "type": "consumer-repo",
+        "repo": "pi-sync",
+        "paths": ["test/native-live-sync.test.mjs"],
+        "reason": "Open session-tree selectors should show newly persisted messages from a same-lane peer instead of staying on their constructor-time tree snapshot."
+      }
+    ]
+  },
+  {
+    "id": "074-tree-selector-refresh-live-tree",
+    "file": "dist/modes/interactive/components/tree-selector.js",
+    "intent": "Refresh TreeList from the optional live tree provider at render time while preserving the current cursor/filter when possible.",
+    "find": "        return labels;\n    }\n    render(width) {\n        const lines = [];",
+    "replace": "        return labels;\n    }\n    refreshTree() {\n        if (typeof this.treeProvider !== \"function\")\n            return;\n        let snapshot;\n        try {\n            snapshot = this.treeProvider();\n        }\n        catch {\n            return;\n        }\n        const tree = Array.isArray(snapshot) ? snapshot : snapshot?.tree;\n        if (!Array.isArray(tree))\n            return;\n        const currentLeafId = Array.isArray(snapshot) ? this.currentLeafId : snapshot?.currentLeafId ?? this.currentLeafId;\n        const ids = [];\n        const stack = [...tree];\n        while (stack.length > 0) {\n            const node = stack.pop();\n            if (!node)\n                continue;\n            ids.push(node.entry?.id ?? \"\");\n            for (let i = node.children.length - 1; i >= 0; i--)\n                stack.push(node.children[i]);\n        }\n        const revision = `${currentLeafId ?? \"\"}:${ids.join(\",\")}`;\n        if (revision === this.treeRevision)\n            return;\n        this.treeRevision = revision;\n        const selectedId = this.filteredNodes[this.selectedIndex]?.node.entry.id ?? this.lastSelectedId;\n        this.currentLeafId = currentLeafId;\n        this.multipleRoots = tree.length > 1;\n        this.flatNodes = this.flattenTree(tree);\n        this.buildActivePath();\n        this.lastSelectedId = selectedId;\n        this.applyFilter();\n    }\n    render(width) {\n        this.refreshTree();\n        const lines = [];",
+    "verify": "refreshTree() {\n        if (typeof this.treeProvider !== \"function\")",
+    "occurrences": 1,
+    "references": [
+      {
+        "type": "consumer-repo",
+        "repo": "pi-sync",
+        "paths": ["test/native-live-sync.test.mjs"],
+        "reason": "Keeps open /tree selectors current while a remote synced terminal appends prompts or responses."
+      }
+    ]
+  },
+  {
+    "id": "075-tree-selector-component-provider-param",
+    "file": "dist/modes/interactive/components/tree-selector.js",
+    "intent": "Thread the optional live tree provider through TreeSelectorComponent into TreeList.",
+    "find": "    constructor(tree, currentLeafId, terminalHeight, onSelect, onCancel, onLabelChange, initialSelectedId, initialFilterMode) {\n        super();\n        this.onLabelChangeCallback = onLabelChange;\n        const maxVisibleLines = Math.max(5, Math.floor(terminalHeight / 2));\n        this.treeList = new TreeList(tree, currentLeafId, maxVisibleLines, initialSelectedId, initialFilterMode);",
+    "replace": "    constructor(tree, currentLeafId, terminalHeight, onSelect, onCancel, onLabelChange, initialSelectedId, initialFilterMode, treeProvider) {\n        super();\n        this.onLabelChangeCallback = onLabelChange;\n        const maxVisibleLines = Math.max(5, Math.floor(terminalHeight / 2));\n        this.treeList = new TreeList(tree, currentLeafId, maxVisibleLines, initialSelectedId, initialFilterMode, treeProvider);",
+    "verify": "this.treeList = new TreeList(tree, currentLeafId, maxVisibleLines, initialSelectedId, initialFilterMode, treeProvider);",
+    "occurrences": 1,
+    "references": [
+      {
+        "type": "consumer-repo",
+        "repo": "pi-sync",
+        "paths": ["test/native-live-sync.test.mjs"],
+        "reason": "Propagates the live session-tree provider used by synced Pi terminals."
+      }
+    ]
+  },
+  {
+    "id": "076-interactive-tree-selector-provider",
+    "file": "dist/modes/interactive/interactive-mode.js",
+    "intent": "Pass the interactive session manager as a live tree provider to TreeSelectorComponent so open tree selectors can refresh from the current session state.",
+    "find": "            }, (entryId, label) => {\n                this.sessionManager.appendLabelChange(entryId, label);\n                this.ui.requestRender();\n            }, initialSelectedId, initialFilterMode);",
+    "replace": "            }, (entryId, label) => {\n                this.sessionManager.appendLabelChange(entryId, label);\n                this.ui.requestRender();\n            }, initialSelectedId, initialFilterMode, () => ({ tree: this.sessionManager.getTree(), currentLeafId: this.sessionManager.getLeafId() }));",
+    "verify": "currentLeafId: this.sessionManager.getLeafId() }));",
+    "occurrences": 1,
+    "references": [
+      {
+        "type": "consumer-repo",
+        "repo": "pi-sync",
+        "paths": ["test/native-live-sync.test.mjs"],
+        "reason": "Allows an already-open /tree view to reflect same-lane remote updates after pi-sync refreshes the local session manager."
+      }
+    ]
   }
 ]
