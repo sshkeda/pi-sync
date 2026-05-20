@@ -1233,3 +1233,41 @@ test('pi-sync refreshes an open session tree when a same-lane peer advances', { 
     await removeRoot(root);
   }
 });
+
+test('pi-sync marks the current single-lane assistant row in the session tree', { timeout: 90_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-sync-current-tree-marker-'));
+  const laneRoot = join(root, 'lane');
+  const sessionFile = join(root, 'shared.jsonl');
+  const piWrapper = join(root, 'pi-wrapper.sh');
+  writeFileSync(sessionFile, '', 'utf8');
+  writeFileSync(piWrapper, `#!/usr/bin/env bash\nargs=()\nfor a in "$@"; do [[ "$a" == "--no-session" ]] && continue; args+=("$a"); done\nexec "${process.env.PI_SYNC_TEST_PI_BINARY ?? 'pi'}" "\${args[@]}"\n`);
+  chmodSync(piWrapper, 0o755);
+
+  const mock = await createInteractiveMock({
+    brain: script(text('SYNC_CURRENT_TREE_MARKER_ANSWER')),
+    extensions: [EXTENSION],
+    piProvider: 'pi-mock',
+    piModel: 'mock',
+    startupTimeoutMs: 20_000,
+    terminal: { cols: 120, rows: 34 },
+    cwd: root,
+    env: { PI_LANE_ROOT: laneRoot, PI_SYNC_POLL_MS: '25', PI_SYNC_HOST_IDLE_MS: '1000' },
+    piBinary: piWrapper,
+    piArgs: ['--session', sessionFile],
+  });
+
+  try {
+    mock.submit('SYNC_CURRENT_TREE_MARKER_PROMPT');
+    await mock.waitForOutput('SYNC_CURRENT_TREE_MARKER_ANSWER', TIMEOUT);
+    await waitForMessageEntry(sessionFile, 'SYNC_CURRENT_TREE_MARKER_ANSWER');
+
+    mock.clearOutput();
+    mock.submit('/tree');
+    const selectedAssistant = await waitForVisibleLine(mock, 'assistant: SYNC_CURRENT_TREE_MARKER_ANSWER', TIMEOUT, 'current assistant tree marker');
+    assert.match(selectedAssistant.line, /\b1\b/, selectedAssistant.screen);
+    assert.doesNotMatch(selectedAssistant.line, /\b2\b/, selectedAssistant.screen);
+  } finally {
+    await mock.close();
+    await removeRoot(root);
+  }
+});

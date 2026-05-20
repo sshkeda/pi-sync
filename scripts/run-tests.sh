@@ -51,6 +51,7 @@ for f in test/*.test.mjs; do
       "same-lane session trees" \
       "disconnected lanes" \
       "open session tree" \
+      "current single-lane" \
       "display ids compact"
     do
       echo "RUN:$f -- $pattern"
