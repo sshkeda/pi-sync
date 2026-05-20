@@ -192,7 +192,7 @@ function sessionFileHasEntry(entryId) {
   }
 }
 
-function sessionFileEntryCount() {
+function readSessionFileEntries() {
   try {
     return readFileSync(sessionFile, 'utf8')
       .split(/\r?\n/)
@@ -200,9 +200,9 @@ function sessionFileEntryCount() {
       .map((line) => {
         try { return JSON.parse(line); } catch { return undefined; }
       })
-      .filter((entry) => entry && entry.type !== 'session').length;
+      .filter(Boolean);
   } catch {
-    return 0;
+    return [];
   }
 }
 
@@ -227,6 +227,12 @@ function persistedMessageCounts() {
   return counts;
 }
 
+function hostSessionFileEntries() {
+  const entries = hostSessionManager?.fileEntries;
+  if (Array.isArray(entries) && entries.length > 0) return entries;
+  return hostSessionManager?.getEntries?.() ?? [];
+}
+
 function reconcileAgentTranscript(reason) {
   if (!agentSession || !hostSessionManager?.appendMessage) return 0;
   const messages = Array.isArray(agentSession.agent?.state?.messages) ? agentSession.agent.state.messages : [];
@@ -248,25 +254,32 @@ function reconcileAgentTranscript(reason) {
 }
 
 function flushHostSessionFile(reason) {
-  const rewriteFile = hostSessionManager?._rewriteFile;
-  if (typeof rewriteFile !== 'function') return false;
-  const memoryEntryCount = hostSessionManager?.getEntries?.().length ?? 0;
-  const diskEntryCount = sessionFileEntryCount();
-  if (memoryEntryCount < diskEntryCount) {
+  const memoryEntries = hostSessionFileEntries();
+  if (!Array.isArray(memoryEntries) || !sessionFile) return false;
+  const memoryNonSessionEntries = memoryEntries.filter((entry) => entry?.type !== 'session');
+  const memoryEntryIds = new Set(memoryNonSessionEntries.map((entry) => entry?.id).filter(Boolean));
+  const diskEntries = readSessionFileEntries();
+  const diskNonSessionEntries = diskEntries.filter((entry) => entry?.type !== 'session');
+  const diskHasUnknownEntry = diskNonSessionEntries.some((entry) => entry?.id && !memoryEntryIds.has(entry.id));
+  if (memoryNonSessionEntries.length < diskNonSessionEntries.length || diskHasUnknownEntry) {
     hostEvent('session_flush_skipped_stale_manager', {
       reason,
-      memoryEntryCount,
-      diskEntryCount,
+      memoryEntryCount: memoryNonSessionEntries.length,
+      diskEntryCount: diskNonSessionEntries.length,
+      diskHasUnknownEntry,
       leafEntryId: hostSessionManager?.getLeafId?.() ?? null,
     });
     return false;
   }
   try {
-    rewriteFile.call(hostSessionManager);
+    mkdirSync(dirname(sessionFile), { recursive: true });
+    const tmp = `${sessionFile}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
+    writeFileSync(tmp, `${memoryEntries.map((entry) => JSON.stringify(entry)).join('\n')}\n`, 'utf8');
+    renameSync(tmp, sessionFile);
     hostEvent('session_flushed', {
       reason,
       leafEntryId: hostSessionManager?.getLeafId?.() ?? null,
-      entries: hostSessionManager?.getEntries?.().length ?? null,
+      entries: memoryEntries.length,
     });
     return true;
   } catch (error) {
@@ -286,6 +299,18 @@ function ensureHostLeafPersisted(reason) {
   const persisted = sessionFileHasEntry(leafEntryId);
   if (!persisted) hostEvent('session_flush_missing_leaf', { reason, leafEntryId });
   return persisted;
+}
+
+function scheduleSessionPersistenceRepair(reason) {
+  for (const delay of [0, 25, 100, 250]) {
+    const timer = setTimeout(() => {
+      const leafEntryId = hostSessionManager?.getLeafId?.() ?? null;
+      if (!leafEntryId || sessionFileHasEntry(leafEntryId)) return;
+      hostEvent('session_repair_missing_leaf', { reason, delay, leafEntryId });
+      ensureHostLeafPersisted(`${reason}:${delay}`);
+    }, delay);
+    timer.unref?.();
+  }
 }
 
 async function waitForAgentEventsDrained(reason) {
@@ -614,6 +639,7 @@ async function pumpQueue() {
     reconcileAgentTranscript('prompt_complete');
     flushHostSessionFile('prompt_complete');
     updateLaneHeadAfterPrompt(prompt);
+    scheduleSessionPersistenceRepair('prompt_complete');
     hostEvent('prompt_end', { promptId: prompt.id });
   } catch (error) {
     if (!abortingPromptIds.has(prompt.id)) {

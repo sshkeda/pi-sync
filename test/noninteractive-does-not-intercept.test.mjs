@@ -96,6 +96,9 @@ test('pi-sync has no fallback transcript widget implementation', () => {
   assert.doesNotMatch(source, /setWidget\("pi-sync"/);
   assert.doesNotMatch(source, new RegExp(['remote', 'live', 'view'].join(' ')));
   assert.doesNotMatch(source, new RegExp(['PI_SYNC', 'FALLBACK', 'WIDGET'].join('_')));
+  assert.doesNotMatch(source, /pi-sync: queued input from attached terminal/);
+  assert.doesNotMatch(source, /pi-sync: remote replay failed/);
+  assert.doesNotMatch(source, /pi-sync: host not ready; prompt not sent/);
 });
 
 test('pi-sync fails early in UI sessions when native replay is unavailable', { timeout: 60_000 }, async () => {

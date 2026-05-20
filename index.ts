@@ -175,6 +175,11 @@ function refreshSessionFile(ctx: ExtensionContext): void {
   }
 }
 
+function disableLocalSessionPersistence(ctx: ExtensionContext): void {
+  const sm = sessionManager(ctx) as (SessionManagerLike & { persist?: boolean }) | undefined;
+  if (sm && "persist" in sm) sm.persist = false;
+}
+
 let moduleCurrentLane = DEFAULT_LANE;
 
 function currentLane(): string {
@@ -1499,10 +1504,9 @@ export default function piSync(pi: ExtensionAPI) {
     const images = Array.isArray(payload?.images) ? payload.images : undefined;
     try {
       pendingQueuedInputs.push({ text, images });
-      if (!EXACT_MODE) ctx.ui.notify(`pi-sync: queued input from attached terminal`, "info");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      ctx.ui.notify(`pi-sync: failed to queue remote input: ${message}`, "warning");
+      if (activeSessionKey) appendDebug(activeSessionKey, "queued_input_error", { message });
     }
     return true;
   }
@@ -1561,7 +1565,7 @@ export default function piSync(pi: ExtensionAPI) {
   function scheduleProcessRemoteEvents(ctx: ExtensionContext): void {
     void processRemoteEvents(ctx).catch((error) => {
       const message = error instanceof Error ? error.message : String(error);
-      ctx.ui.notify(`pi-sync: remote replay failed: ${message}`, "warning");
+      if (activeSessionKey) appendDebug(activeSessionKey, "remote_replay_failed", { message });
     });
   }
 
@@ -1732,6 +1736,7 @@ export default function piSync(pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     if (!ctx.hasUI) return;
     nativeReplay(ctx);
+    disableLocalSessionPersistence(ctx);
     if (EXACT_MODE) ctx.ui.setWorkingVisible(false);
     initializeLaneSession(ctx);
     startTerminalInputSync(ctx);
@@ -1775,9 +1780,7 @@ export default function piSync(pi: ExtensionAPI) {
       connectHost(ctx);
       renderOptimisticUserMessage(ctx, event.text, "own");
       publish(ctx, "prompt_echo", { text: event.text });
-      if (!sendHostPrompt(ctx, event.text)) {
-        ctx.ui.notify("pi-sync: host not ready; prompt not sent", "warning");
-      }
+      sendHostPrompt(ctx, event.text);
       return { action: "handled" };
     }
     await waitForRemoteFlushBeforeLocalCommand(ctx);
