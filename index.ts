@@ -254,21 +254,6 @@ function persistedEntryExists(path: string | undefined, entryId: string): boolea
   return false;
 }
 
-function persistedMessageEntryIds(path: string | undefined): Set<string> {
-  const ids = new Set<string>();
-  if (!path || !existsSync(path)) return ids;
-  try {
-    const lines = readFileSync(path, "utf8").trim().split(/\r?\n/).filter(Boolean);
-    for (const line of lines) {
-      const entry = JSON.parse(line) as { type?: string; id?: unknown };
-      if (entry.type === "message" && typeof entry.id === "string") ids.add(entry.id);
-    }
-  } catch {
-    ids.clear();
-  }
-  return ids;
-}
-
 function persistedRootMarkerEntryId(path: string | undefined): string | undefined {
   if (!path || !existsSync(path)) return undefined;
   try {
@@ -276,6 +261,30 @@ function persistedRootMarkerEntryId(path: string | undefined): string | undefine
     for (const line of lines) {
       const entry = JSON.parse(line) as { type?: string; id?: unknown; parentId?: unknown };
       if (entry.type === "message" && typeof entry.id === "string" && entry.parentId == null) return entry.id;
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+function persistedMarkerEntryId(path: string | undefined, headEntryId: string | null): string | undefined {
+  if (headEntryId === null) return persistedRootMarkerEntryId(path);
+  if (!path || !existsSync(path)) return undefined;
+  try {
+    const entries = new Map<string, { type?: string; id?: unknown; parentId?: unknown }>();
+    for (const line of readFileSync(path, "utf8").trim().split(/\r?\n/).filter(Boolean)) {
+      const entry = JSON.parse(line) as { type?: string; id?: unknown; parentId?: unknown };
+      if (typeof entry.id === "string") entries.set(entry.id, entry);
+    }
+    let currentId: string | null | undefined = headEntryId;
+    const seen = new Set<string>();
+    while (currentId && !seen.has(currentId)) {
+      seen.add(currentId);
+      const entry = entries.get(currentId);
+      if (!entry) return undefined;
+      if (entry.type === "message") return currentId;
+      currentId = typeof entry.parentId === "string" ? entry.parentId : null;
     }
   } catch {
     return undefined;
@@ -648,12 +657,12 @@ export default function piSync(pi: ExtensionAPI) {
     else process.env.PI_LANE_ROOT = initialLaneRootEnv;
   }
 
-  function updateTreeMarkers(sessionKey: string | undefined = currentSessionKey ?? activeSessionKey, file: string | undefined = currentSessionFile ?? activeSessionFile): void {
+  function updateTreeMarkers(sessionKey: string | undefined = currentSessionKey ?? activeSessionKey, file: string | undefined = currentSessionFile ?? activeSessionFile): boolean {
+    const previous = process.env.PI_SYNC_TREE_MARKERS;
     if (!sessionKey || !file) {
       delete process.env.PI_SYNC_TREE_MARKERS;
-      return;
+      return previous !== undefined;
     }
-    const messageIds = persistedMessageEntryIds(file);
     const activeLaneNames = new Set<string>();
     for (const instance of liveLaneInstances(sessionKey)) {
       activeLaneNames.add(sanitizeLaneName(instance.lane));
@@ -665,11 +674,7 @@ export default function piSync(pi: ExtensionAPI) {
     for (const lane of readLaneStates(sessionKey)) {
       if (!activeLaneNames.has(sanitizeLaneName(lane.name))) continue;
       const headEntryId = lane.headEntryId ?? null;
-      const markerEntryId = headEntryId && messageIds.has(headEntryId)
-        ? headEntryId
-        : headEntryId === null
-          ? persistedRootMarkerEntryId(file)
-          : undefined;
+      const markerEntryId = persistedMarkerEntryId(file, headEntryId);
       if (!markerEntryId) continue;
       const id = liveLaneId(sessionKey, lane.name);
       markers[markerEntryId] = [...(markers[markerEntryId] ?? []), id];
@@ -685,6 +690,7 @@ export default function piSync(pi: ExtensionAPI) {
     } else {
       delete process.env.PI_SYNC_TREE_MARKERS;
     }
+    return previous !== process.env.PI_SYNC_TREE_MARKERS;
   }
 
   function syncSessionLeafToLaneHead(ctx: ExtensionContext, sessionKey: string | undefined = activeSessionKey, laneName: string = activeLane ?? currentLane()): void {
@@ -735,7 +741,7 @@ export default function piSync(pi: ExtensionAPI) {
       lastSeenAt: nowIso(),
     };
     writeJsonFile(instancePath(currentSessionKey, instanceId), state);
-    updateTreeMarkers(currentSessionKey, file);
+    if (updateTreeMarkers(currentSessionKey, file)) (ctx.ui as any)?.requestRender?.();
   }
 
   function readLaneInstances(sessionKey: string): InstanceState[] {

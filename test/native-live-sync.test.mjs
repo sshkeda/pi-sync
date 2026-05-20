@@ -1341,3 +1341,65 @@ export default function rootTreeHelper(pi) {
     await removeRoot(root);
   }
 });
+
+test('pi-sync shows multiple live lanes on the same visible tree row', { timeout: 90_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-sync-same-row-markers-'));
+  const laneRoot = join(root, 'lane');
+  const sessionFile = join(root, 'shared.jsonl');
+  const piWrapper = join(root, 'pi-wrapper.sh');
+  writeFileSync(sessionFile, [
+    JSON.stringify({ type: 'session', version: 3, id: 'same-row-marker-session', timestamp: new Date().toISOString(), cwd: root }),
+    JSON.stringify({ type: 'message', id: 'same-row-user', parentId: null, timestamp: new Date().toISOString(), message: { role: 'user', content: [{ type: 'text', text: 'SYNC_SAME_ROW_PROMPT' }] } }),
+    JSON.stringify({ type: 'message', id: 'same-row-assistant', parentId: 'same-row-user', timestamp: new Date().toISOString(), message: { role: 'assistant', content: [{ type: 'text', text: 'SYNC_SAME_ROW_ANSWER' }], stopReason: 'stop', usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }),
+    JSON.stringify({ type: 'thinking_level_change', id: 'same-row-hidden-tail', parentId: 'same-row-assistant', timestamp: new Date().toISOString(), thinkingLevel: 'off' }),
+    '',
+  ].join('\n'), 'utf8');
+  writeFileSync(piWrapper, `#!/usr/bin/env bash\nargs=()\nfor a in "$@"; do [[ "$a" == "--no-session" ]] && continue; args+=("$a"); done\nexec "${process.env.PI_SYNC_TEST_PI_BINARY ?? 'pi'}" "\${args[@]}"\n`);
+  chmodSync(piWrapper, 0o755);
+
+  const common = {
+    brain: script(text('UNUSED_SAME_ROW_RESPONSE')),
+    extensions: [EXTENSION],
+    piProvider: 'pi-mock',
+    piModel: 'mock',
+    startupTimeoutMs: 20_000,
+    terminal: { cols: 120, rows: 34 },
+    cwd: root,
+    env: {
+      PI_LANE_ROOT: laneRoot,
+      PI_SYNC_POLL_MS: '25',
+      PI_SYNC_HOST_IDLE_MS: '1000',
+      PI_LANE_HEARTBEAT_MS: '100',
+      PI_SYNC_INSTANCE_STALE_MS: '5000',
+    },
+    piBinary: piWrapper,
+    piArgs: ['--session', sessionFile],
+  };
+
+  const treeViewer = await createInteractiveMock(common);
+  const laneCreator = await createInteractiveMock(common);
+  try {
+    await treeViewer.waitForOutput('SYNC_SAME_ROW_ANSWER', TIMEOUT);
+    await laneCreator.waitForOutput('SYNC_SAME_ROW_ANSWER', TIMEOUT);
+
+    treeViewer.clearOutput();
+    treeViewer.submit('/tree');
+    const initialLine = await waitForVisibleLine(treeViewer, 'assistant: SYNC_SAME_ROW_ANSWER', TIMEOUT, 'initial same-row marker');
+    assert.match(initialLine.line, /\b1\b/, initialLine.screen);
+    assert.doesNotMatch(initialLine.line, /\b2\b/, initialLine.screen);
+
+    laneCreator.clearOutput();
+    laneCreator.submit('/lane new');
+    await laneCreator.waitForOutput(/created and joined 2 \(lane-2\)/, TIMEOUT);
+
+    await waitUntil(async () => {
+      const screen = await visibleText(treeViewer);
+      const line = lineContaining(screen, 'assistant: SYNC_SAME_ROW_ANSWER');
+      return /\b1,2\b/.test(line) && !/\b3\b/.test(line);
+    }, TIMEOUT, 'open tree marker updates to 1,2 for two live lanes on one row');
+  } finally {
+    await treeViewer.close();
+    await laneCreator.close();
+    await removeRoot(root);
+  }
+});
