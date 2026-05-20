@@ -104,7 +104,7 @@ test('pi-sync golden UX: late join, lane switch, abort, and cardinality stay det
 
     b.clearOutput();
     b.submit('/lane new side');
-    await b.waitForOutput(/created and joined side/, TIMEOUT);
+    await b.waitForOutput(/created and joined 2 \(side\)/, TIMEOUT);
     b.clearOutput();
 
     a.sendKey('escape');

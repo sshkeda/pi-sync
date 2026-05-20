@@ -16,7 +16,7 @@ import {
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Key, matchesKey } from "@earendil-works/pi-tui";
+import { Key, matchesKey, type AutocompleteItem } from "@earendil-works/pi-tui";
 import {
   DEFAULT_LANE,
   type InstanceState,
@@ -681,11 +681,37 @@ export default function piSync(pi: ExtensionAPI) {
   function normalizeLaneSelector(value: string | undefined): string {
     const raw = String(value ?? "").trim();
     if (!raw) return DEFAULT_LANE;
+    const marker = /^~\/(\d+)$/.exec(raw);
+    if (marker) return `L${marker[1]}`;
     if (/^\d+$/.test(raw)) return `L${raw}`;
     return raw;
   }
 
+  function laneNamesForLiveDisplay(sessionKey: string): string[] {
+    const names = new Set<string>([DEFAULT_LANE]);
+    const instances = readLaneInstances(sessionKey);
+    for (const instance of instances) {
+      if (isLiveLaneInstance(instance)) names.add(sanitizeLaneName(instance.lane));
+    }
+    return [...names].sort((a, b) => {
+      if (a === DEFAULT_LANE) return -1;
+      if (b === DEFAULT_LANE) return 1;
+      return a.localeCompare(b);
+    });
+  }
+
+  function resolveLiveLaneDisplayName(sessionKey: string, selector: string | undefined): string | undefined {
+    const normalized = normalizeLaneSelector(selector);
+    const match = /^L(\d+)$/i.exec(normalized);
+    if (!match) return undefined;
+    const index = Number(match[1]) - 1;
+    const names = laneNamesForLiveDisplay(sessionKey);
+    return index >= 0 ? names[index] : undefined;
+  }
+
   function resolveLaneName(sessionKey: string, selector: string | undefined): string | undefined {
+    const liveName = resolveLiveLaneDisplayName(sessionKey, selector);
+    if (liveName) return liveName;
     const normalized = normalizeLaneSelector(selector);
     const sanitized = sanitizeLaneName(normalized);
     const lanes = readLaneStates(sessionKey);
@@ -702,6 +728,72 @@ export default function piSync(pi: ExtensionAPI) {
     return readLaneInstances(sessionKey)
       .filter((item) => isLiveLaneInstance(item))
       .filter((item) => lane === undefined || sanitizeLaneName(item.lane) === sanitizeLaneName(lane));
+  }
+
+  function nextDefaultLaneName(sessionKey: string): string {
+    const used = new Set(readLaneStates(sessionKey).map((lane) => sanitizeLaneName(lane.name)));
+    for (let index = 2; index < 10_000; index++) {
+      const name = `lane-${index}`;
+      if (!used.has(name)) return name;
+    }
+    return `lane-${Date.now().toString(36)}`;
+  }
+
+  function laneIdFromDisplayId(displayId: string): string {
+    const match = /^L(\d+)$/i.exec(displayId);
+    return match ? match[1] : displayId;
+  }
+
+  function liveLaneId(sessionKey: string, lane: string): string {
+    return laneIdFromDisplayId(activeLaneDisplayId(sessionKey, lane));
+  }
+
+  function displayLane(sessionKey: string, lane: LaneState): string {
+    const id = liveLaneId(sessionKey, lane.name);
+    return id === lane.name ? id : `${id} (${lane.name})`;
+  }
+
+  const laneSubcommands: AutocompleteItem[] = [
+    { value: "status", label: "status", description: "Show current lane state" },
+    { value: "new ", label: "new", description: "Create and join a lane" },
+    { value: "join ", label: "join", description: "Join an existing lane" },
+    { value: "list", label: "list", description: "List lanes and live instances" },
+    { value: "instances", label: "instances", description: "List live terminal instances" },
+    { value: "identity", label: "identity", description: "Show exported sync identity" },
+    { value: "debug", label: "debug", description: "Show the pi-sync debug log path" },
+  ];
+
+  function filterCompletions(items: AutocompleteItem[], prefix: string): AutocompleteItem[] {
+    const normalized = prefix.trim().toLowerCase();
+    if (!normalized) return items;
+    return items.filter((item) => item.label.toLowerCase().startsWith(normalized) || item.value.toLowerCase().startsWith(normalized));
+  }
+
+  function laneArgumentCompletions(argumentPrefix: string): AutocompleteItem[] | null {
+    const raw = String(argumentPrefix ?? "");
+    const trimmed = raw.trimStart();
+    const endsWithSpace = /\s$/.test(trimmed);
+    const parts = trimmed.split(/\s+/).filter(Boolean);
+    if (parts.length === 0 || (!endsWithSpace && parts.length === 1)) {
+      return filterCompletions(laneSubcommands, parts[0] ?? "");
+    }
+
+    const command = parts[0];
+    if (command !== "join") return null;
+
+    const key = currentSessionKey ?? activeSessionKey ?? process.env.PI_SYNC_SESSION_KEY ?? process.env.PI_LANE_SESSION_KEY;
+    const lanes = key ? laneNamesForLiveDisplay(key).map((name) => readLane(key, name)).filter((lane): lane is LaneState => !!lane) : [];
+    const selectorPrefix = endsWithSpace ? "" : parts[1] ?? "";
+    const items = lanes
+      .map((lane) => {
+        const id = key ? liveLaneId(key, lane.name) : lane.name;
+        return {
+          value: `join ${id}`,
+          label: id,
+          description: lane.name,
+        };
+      });
+    return filterCompletions(items, selectorPrefix);
   }
 
   function notifyLane(ctx: ExtensionContext, message: string): void {
@@ -1611,6 +1703,7 @@ export default function piSync(pi: ExtensionAPI) {
 
   pi.registerCommand("lane", {
     description: "Show, join, or create Pi sync lanes. Usage: /lane [status|new|join|list|identity|debug]",
+    getArgumentCompletions: laneArgumentCompletions,
     handler: async (args: string, ctx: ExtensionContext) => {
       const file = sessionFile(ctx);
       if (!file) {
@@ -1622,13 +1715,13 @@ export default function piSync(pi: ExtensionAPI) {
       const command = rawCommand || "status";
 
       if (command === "new") {
-        const name = sanitizeLaneName(rawName || `lane-${Date.now().toString(36)}`);
+        const name = sanitizeLaneName(rawName || nextDefaultLaneName(key));
         const leaf = sessionManager(ctx)?.getLeafId?.() ?? null;
         moduleCurrentLane = name;
-        ensureLane(key, file, name, leaf);
+        const lane = ensureLane(key, file, name, leaf);
         writeLaneInstance(ctx, file, "idle");
         refreshAfterCommand(ctx);
-        notifyLane(ctx, `pi-sync lane: created and joined ${name}`);
+        notifyLane(ctx, `pi-sync lane: created and joined ${displayLane(key, lane)}`);
         return;
       }
 
@@ -1646,22 +1739,22 @@ export default function piSync(pi: ExtensionAPI) {
         else sessionManager(ctx)?.resetLeaf?.();
         writeLaneInstance(ctx, file, "idle");
         refreshAfterCommand(ctx);
-        notifyLane(ctx, `pi-sync lane: joined ${existingLane.displayId ?? name} (${name})`);
+        notifyLane(ctx, `pi-sync lane: joined ${displayLane(key, existingLane)}`);
         return;
       }
 
       if (command === "list") {
         const names = readLaneStates(key)
-          .sort((a, b) => (a.displayId ?? a.name).localeCompare(b.displayId ?? b.name, undefined, { numeric: true }))
-          .map((item) => `${item.displayId ?? item.name}(${item.name})`);
+          .sort((a, b) => liveLaneId(key, a.name).localeCompare(liveLaneId(key, b.name), undefined, { numeric: true }))
+          .map((item) => `${liveLaneId(key, item.name)}(${item.name})`);
         const instances = liveLaneInstances(key)
           .map((item) => {
             const lane = readLane(key, item.lane);
-            return `${lane?.displayId ?? item.lane}:${item.status}:${item.pid}`;
+            return `${lane ? liveLaneId(key, lane.name) : item.lane}:${item.status}:${item.pid}`;
           })
           .join(", ");
         const current = ensureLane(key, file, currentLane(), sessionManager(ctx)?.getLeafId?.() ?? null);
-        notifyLane(ctx, `pi-sync lane: lanes ${names.join(", ") || "L1(main)"}; current ${current.displayId ?? current.name}; instances ${instances || "none"}`);
+        notifyLane(ctx, `pi-sync lane: lanes ${names.join(", ") || "1(main)"}; current ${liveLaneId(key, current.name)}; instances ${instances || "none"}`);
         return;
       }
 
@@ -1696,7 +1789,7 @@ export default function piSync(pi: ExtensionAPI) {
       const hostSummary = freshHost
         ? `host pid=${freshHost.pid} clients=${freshHost.clients ?? 0} active=${freshHost.activePromptId ?? "<none>"} pending=${freshHost.pendingPrompts ?? 0}`
         : "host=<none>";
-      notifyLane(ctx, `pi-sync lane: current ${lane.displayId ?? lane.name} (${lane.name}); file ${lane.aliasPath ?? "<none>"}; head ${lane.headEntryId ?? "<empty>"}; connected ${instances.length}; ${hostSummary}`);
+      notifyLane(ctx, `pi-sync lane: current ${displayLane(key, lane)}; file ${lane.aliasPath ?? "<none>"}; head ${lane.headEntryId ?? "<empty>"}; connected ${instances.length}; ${hostSummary}`);
     },
   });
 

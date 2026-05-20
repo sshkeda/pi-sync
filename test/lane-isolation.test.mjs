@@ -68,7 +68,7 @@ test('pi-sync stops replaying an active stream to a terminal after it switches l
 
     b.clearOutput();
     b.submit('/lane new side');
-    await b.waitForOutput(/created and joined side/, TIMEOUT);
+    await b.waitForOutput(/created and joined 2 \(side\)/, TIMEOUT);
     b.clearOutput();
 
     call.respond(text('SYNC_LANE_ACTIVE_RESPONSE_AFTER_SWITCH'));
@@ -82,7 +82,7 @@ test('pi-sync stops replaying an active stream to a terminal after it switches l
     );
 
     b.submit('/lane status');
-    await b.waitForOutput(/current L2 \(side\)[\s\S]*connected 1/, TIMEOUT);
+    await b.waitForOutput(/current 2 \(side\)[\s\S]*connected 1/, TIMEOUT);
   } finally {
     await a.close();
     await b.close();
@@ -96,7 +96,7 @@ test('pi-sync does not mirror side-lane prompts or responses into the main lane 
     a.clearOutput();
     b.clearOutput();
     a.submit('/lane new side');
-    await a.waitForOutput(/created and joined side/, TIMEOUT);
+    await a.waitForOutput(/created and joined 2 \(side\)/, TIMEOUT);
 
     a.clearOutput();
     b.clearOutput();
@@ -110,7 +110,7 @@ test('pi-sync does not mirror side-lane prompts or responses into the main lane 
     assert.doesNotMatch(b.output, /SYNC_SIDE_LANE_RESPONSE/, 'main lane terminal must not receive side lane response');
 
     b.submit('/lane status');
-    await b.waitForOutput(/current L1 \(main\)[\s\S]*connected 1/, TIMEOUT);
+    await b.waitForOutput(/current 1 \(main\)[\s\S]*connected 1/, TIMEOUT);
   } finally {
     await a.close();
     await b.close();
