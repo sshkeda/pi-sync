@@ -606,6 +606,7 @@ export default function piSync(pi: ExtensionAPI) {
       delete process.env.PI_SYNC_CHANNEL_FILE;
       delete process.env.PI_LANE_CURRENT_LANE_FILE;
     }
+    updateTreeMarkers(key, file);
     return lane;
   }
 
@@ -739,13 +740,8 @@ export default function piSync(pi: ExtensionAPI) {
 
   function activeLaneDisplayId(sessionKey: string, lane: string): string {
     const name = sanitizeLaneName(lane);
-    if (name === DEFAULT_LANE) return "L1";
-    const activeLanes = new Set<string>([DEFAULT_LANE, name]);
-    for (const instance of readLaneInstances(sessionKey)) {
-      if (isLiveLaneInstance(instance)) activeLanes.add(sanitizeLaneName(instance.lane));
-    }
-    const nonMain = [...activeLanes].filter((item) => item !== DEFAULT_LANE).sort((a, b) => a.localeCompare(b));
-    return `L${nonMain.indexOf(name) + 2}`;
+    const names = laneNamesForLiveDisplay(sessionKey, name);
+    return `L${Math.max(0, names.indexOf(name)) + 1}`;
   }
 
   function readLaneStates(sessionKey: string): LaneState[] {
@@ -769,12 +765,14 @@ export default function piSync(pi: ExtensionAPI) {
     return raw;
   }
 
-  function laneNamesForLiveDisplay(sessionKey: string): string[] {
-    const names = new Set<string>([DEFAULT_LANE]);
+  function laneNamesForLiveDisplay(sessionKey: string, includeLane?: string): string[] {
+    const names = new Set<string>();
     const instances = readLaneInstances(sessionKey);
     for (const instance of instances) {
       if (isLiveLaneInstance(instance)) names.add(sanitizeLaneName(instance.lane));
     }
+    if (includeLane) names.add(sanitizeLaneName(includeLane));
+    if (names.size === 0) names.add(DEFAULT_LANE);
     return [...names].sort((a, b) => {
       if (a === DEFAULT_LANE) return -1;
       if (b === DEFAULT_LANE) return 1;

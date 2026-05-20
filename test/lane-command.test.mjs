@@ -175,11 +175,11 @@ test('pi-sync lane status counts live terminals per lane and numeric join resolv
 
     b.clearOutput();
     b.submit('/lane join 2');
-    await b.waitForOutput(/joined 2 \(side\)/, TIMEOUT);
+    await b.waitForOutput(/joined 1 \(side\)/, TIMEOUT);
 
     b.clearOutput();
     b.submit('/lane status');
-    await b.waitForOutput(/current 2 \(side\)[\s\S]*connected 2/, TIMEOUT);
+    await b.waitForOutput(/current 1 \(side\)[\s\S]*connected 2/, TIMEOUT);
 
     const screen = (await b.visibleScreen()).join('\n');
     assert.doesNotMatch(screen, /no lane 2/, screen);
@@ -206,7 +206,13 @@ test('pi-sync compacts visible lane labels after a peer lane disconnects', { tim
     startupTimeoutMs: 20_000,
     terminal: { cols: 240, rows: 32 },
     cwd: root,
-    env: { PI_LANE_ROOT: laneRoot, PI_SYNC_POLL_MS: '25', PI_SYNC_HOST_IDLE_MS: '1000', PI_SYNC_INSTANCE_STALE_MS: '250' },
+    env: {
+      PI_LANE_ROOT: laneRoot,
+      PI_SYNC_POLL_MS: '25',
+      PI_SYNC_HOST_IDLE_MS: '1000',
+      PI_SYNC_INSTANCE_STALE_MS: '500',
+      PI_LANE_HEARTBEAT_MS: '100',
+    },
     piBinary: piWrapper,
     piArgs: ['--session', sessionFile],
   };

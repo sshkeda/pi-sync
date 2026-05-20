@@ -196,6 +196,18 @@ function lineContaining(screen, needle) {
   return screen.split('\n').find((line) => line.includes(needle)) ?? '';
 }
 
+async function waitForVisibleLine(mock, needle, timeoutMs, label) {
+  const start = Date.now();
+  let screen = '';
+  while (Date.now() - start < timeoutMs) {
+    screen = await visibleText(mock);
+    const line = lineContaining(screen, needle);
+    if (line) return { line, screen };
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`timeout waiting for ${label}\n${screen}`);
+}
+
 async function removeRoot(root) {
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
@@ -909,7 +921,7 @@ export default function treeHeadHelper(pi) {
     await b.waitForOutput(/current 2 \(tree-/, TIMEOUT);
 
     a.submit('/lane join 2');
-    await a.waitForOutput(/joined 2 \(tree-/, TIMEOUT);
+    await a.waitForOutput(/joined 1 \(tree-/, TIMEOUT);
     a.clearOutput();
     a.submit('/_leaf_text');
     await a.waitForOutput('leaf_text:SYNC_MARKER_BASE_ANSWER', TIMEOUT);
@@ -934,16 +946,17 @@ export default function treeHeadHelper(pi) {
     a.submit('/_tree_markers');
     await a.waitForOutput('tree_markers:', TIMEOUT);
     assert.doesNotMatch(a.output, /tree_markers:<empty>/, a.output);
-    assert.match(a.output, /2:SYNC_MARKER_BRANCH_ANSWER/, a.output);
+    assert.match(a.output, /1:SYNC_MARKER_BRANCH_ANSWER/, a.output);
+    assert.doesNotMatch(a.output, /2:SYNC_MARKER_BRANCH_ANSWER/, a.output);
 
     a.clearOutput();
     b.clearOutput();
     a.submit('/tree');
     b.submit('/tree');
-    const screenA = await waitForVisibleText(a, /›\s+2[\s\S]*•\s+assistant:\s+SYNC_MARKER_BRANCH_ANSWER/, TIMEOUT, 'terminal A selected tree head marker');
-    const screenB = await waitForVisibleText(b, /›\s+2[\s\S]*•\s+assistant:\s+SYNC_MARKER_BRANCH_ANSWER/, TIMEOUT, 'terminal B selected tree head marker');
-    assert.doesNotMatch(screenA, /›\s+1[\s\S]*•\s+assistant:\s+SYNC_MARKER_BRANCH_ANSWER/, screenA);
-    assert.doesNotMatch(screenB, /›\s+1[\s\S]*•\s+assistant:\s+SYNC_MARKER_BRANCH_ANSWER/, screenB);
+    const screenA = await waitForVisibleText(a, /›\s+1[\s\S]*•\s+assistant:\s+SYNC_MARKER_BRANCH_ANSWER/, TIMEOUT, 'terminal A selected tree head marker');
+    const screenB = await waitForVisibleText(b, /›\s+1[\s\S]*•\s+assistant:\s+SYNC_MARKER_BRANCH_ANSWER/, TIMEOUT, 'terminal B selected tree head marker');
+    assert.doesNotMatch(screenA, /›\s+2[\s\S]*•\s+assistant:\s+SYNC_MARKER_BRANCH_ANSWER/, screenA);
+    assert.doesNotMatch(screenB, /›\s+2[\s\S]*•\s+assistant:\s+SYNC_MARKER_BRANCH_ANSWER/, screenB);
   } finally {
     await a.close();
     await b.close();
@@ -1030,18 +1043,20 @@ export default function treeNavHelper(pi) {
     await mock.waitForOutput('leaf_after_nav:', TIMEOUT);
     mock.clearOutput();
     mock.submit('/_tree_markers');
-    await mock.waitForOutput(/2:SYNC_DISPLAY_ONE_ANSWER/, TIMEOUT);
+    await mock.waitForOutput(/1:SYNC_DISPLAY_ONE_ANSWER/, TIMEOUT);
     assert.doesNotMatch(mock.output, /1:SYNC_DISPLAY_THREE_ANSWER/, mock.output);
     mock.clearOutput();
     mock.submit('/tree');
-    const treeOnLane2 = await waitForVisibleText(mock, 'SYNC_DISPLAY_ONE_ANSWER', TIMEOUT, 'visible tree marker on lane 2 head');
-    assert.match(lineContaining(treeOnLane2, 'assistant: SYNC_DISPLAY_ONE_ANSWER'), /\b2\b/, treeOnLane2);
-    assert.doesNotMatch(lineContaining(treeOnLane2, 'assistant: SYNC_DISPLAY_THREE_ANSWER'), /\b1\b/);
+    const treeOnLane1 = await waitForVisibleText(mock, 'SYNC_DISPLAY_ONE_ANSWER', TIMEOUT, 'visible tree marker on lone tree lane head');
+    assert.match(lineContaining(treeOnLane1, 'assistant: SYNC_DISPLAY_ONE_ANSWER'), /\b1\b/, treeOnLane1);
+    assert.doesNotMatch(lineContaining(treeOnLane1, 'assistant: SYNC_DISPLAY_ONE_ANSWER'), /\b2\b/);
+    assert.doesNotMatch(lineContaining(treeOnLane1, 'assistant: SYNC_DISPLAY_THREE_ANSWER'), /\b1\b/);
     mock.sendKey('escape');
     await waitUntilQuiet(async () => !(await visibleText(mock)).includes('Session Tree'), TIMEOUT);
     mock.clearOutput();
     mock.submit('/lane identity');
-    await mock.waitForOutput(/laneId=L2/, TIMEOUT);
+    await mock.waitForOutput(/laneId=L1/, TIMEOUT);
+    assert.doesNotMatch(mock.output, /laneId=L2/, mock.output);
 
     mock.clearOutput();
     mock.submit('/lane join main');
@@ -1062,7 +1077,8 @@ export default function treeNavHelper(pi) {
     await mock.waitForOutput('leaf_after_nav:', TIMEOUT);
     mock.clearOutput();
     mock.submit('/lane identity');
-    await mock.waitForOutput(/laneId=L2/, TIMEOUT);
+    await mock.waitForOutput(/laneId=L1/, TIMEOUT);
+    assert.doesNotMatch(mock.output, /laneId=L2/, mock.output);
     assert.doesNotMatch(mock.output, /laneId=L3/, mock.output);
   } finally {
     await mock.close();
@@ -1146,9 +1162,15 @@ export default function treeNavHelper(pi) {
     await new Promise((resolve) => setTimeout(resolve, 800));
 
     branch.clearOutput();
+    branch.submit('/lane identity');
+    await branch.waitForOutput(/laneId=L1/, TIMEOUT);
+    assert.doesNotMatch(branch.output, /laneId=L2/, branch.output);
+
+    branch.clearOutput();
     branch.submit('/tree');
     const withoutPeer = await waitForVisibleText(branch, 'SYNC_DISCONNECT_MAIN_ANSWER', TIMEOUT, 'tree marker after main peer disconnects');
-    assert.match(lineContaining(withoutPeer, 'assistant: SYNC_DISCONNECT_BASE_ANSWER'), /\b2\b/, withoutPeer);
+    assert.match(lineContaining(withoutPeer, 'assistant: SYNC_DISCONNECT_BASE_ANSWER'), /\b1\b/, withoutPeer);
+    assert.doesNotMatch(lineContaining(withoutPeer, 'assistant: SYNC_DISCONNECT_BASE_ANSWER'), /\b2\b/);
     assert.doesNotMatch(lineContaining(withoutPeer, 'assistant: SYNC_DISCONNECT_MAIN_ANSWER'), /\b1\b/);
   } finally {
     await main.close();
@@ -1203,8 +1225,8 @@ test('pi-sync refreshes an open session tree when a same-lane peer advances', { 
     await submitter.waitForOutput('SYNC_OPEN_TREE_NEXT_ANSWER', TIMEOUT);
     await waitForMessageEntry(sessionFile, 'SYNC_OPEN_TREE_NEXT_ANSWER');
 
-    const refreshedTree = await waitForVisibleText(watcher, 'SYNC_OPEN_TREE_NEXT_ANSWER', TIMEOUT, 'open tree refresh after peer advances');
-    assert.match(lineContaining(refreshedTree, 'assistant: SYNC_OPEN_TREE_NEXT_ANSWER'), /\b1\b/, refreshedTree);
+    const refreshedTree = await waitForVisibleLine(watcher, 'assistant: SYNC_OPEN_TREE_NEXT_ANSWER', TIMEOUT, 'open tree refresh after peer advances');
+    assert.match(refreshedTree.line, /\b1\b/, refreshedTree.screen);
   } finally {
     await watcher.close();
     await submitter.close();
