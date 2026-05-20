@@ -167,6 +167,20 @@ function appendJsonl(path, value) {
   appendFileSync(path, JSON.stringify(value) + '\n');
 }
 
+function readJsonl(path) {
+  try {
+    return readFileSync(path, 'utf8')
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => {
+        try { return JSON.parse(line); } catch { return undefined; }
+      })
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
 function readJson(path) {
   try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return undefined; }
 }
@@ -590,6 +604,46 @@ function enqueuePrompt(payload) {
   void pumpQueue();
 }
 
+function recoverPendingPromptsFromDisk() {
+  if (pendingPrompts.length > 0) return;
+  const queuedPrompts = readJsonl(promptQueuePath).filter((item) => typeof item?.id === 'string');
+  if (queuedPrompts.length === 0) return;
+
+  const queuedById = new Map(queuedPrompts.map((prompt) => [prompt.id, prompt]));
+  const pendingIds = queuedPrompts.map((prompt) => prompt.id);
+  const removePending = (promptId) => {
+    const index = pendingIds.indexOf(promptId);
+    if (index >= 0) pendingIds.splice(index, 1);
+  };
+
+  for (const event of readJsonl(hostEventsPath)) {
+    const promptId = event?.payload?.promptId;
+    if (event?.type === 'prompt_dequeued' && typeof promptId === 'string') {
+      removePending(promptId);
+    }
+    if ((event?.type === 'prompt_end' || event?.type === 'prompt_error') && typeof promptId === 'string') {
+      removePending(promptId);
+    }
+    if (event?.type === 'abort_requested') {
+      const activePromptId = event?.payload?.activePromptId;
+      if (typeof activePromptId === 'string') removePending(activePromptId);
+      const cleared = Number(event?.payload?.clearedPendingPrompts ?? 0);
+      for (let i = 0; i < cleared && pendingIds.length > 0; i++) pendingIds.shift();
+    }
+  }
+
+  const recovered = pendingIds
+    .map((id) => queuedById.get(id))
+    .filter(Boolean);
+  if (recovered.length === 0) return;
+  pendingPrompts.push(...recovered);
+  hostEvent('prompt_queue_recovered', {
+    recovered: recovered.length,
+    promptIds: recovered.map((prompt) => prompt.id),
+  });
+  writeHostInfo();
+}
+
 async function abortActive(payload = {}) {
   cancelIdleShutdown();
   const activePromptId = activePrompt?.id ?? null;
@@ -715,6 +769,7 @@ process.on('uncaughtException', (error) => {
 server.listen(socketPath, () => {
   writeHostInfo();
   hostEvent('host_start', { pid: process.pid, socketPath });
+  recoverPendingPromptsFromDisk();
   void initAgent().catch((error) => {
     hostEvent('agent_init_error', { message: error instanceof Error ? error.message : String(error), stack: error instanceof Error ? error.stack : undefined });
     shutdown('agent_init_error');

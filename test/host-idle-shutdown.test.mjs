@@ -4,7 +4,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { connect } from 'node:net';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { createControllableBrain, createGateway } from '../../pi-mock/dist/index.js';
 
 const HOST = new URL('../bin/pi-sync-host.js', import.meta.url).pathname;
@@ -58,6 +58,11 @@ function readEvents(path) {
     .map((line) => JSON.parse(line));
 }
 
+function appendJsonl(path, value) {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify(value) + '\n', { flag: 'a' });
+}
+
 function writeAgentDir(root, port) {
   const agentDir = join(root, 'agent');
   mkdirSync(agentDir, { recursive: true });
@@ -78,6 +83,91 @@ function writeAgentDir(root, port) {
   }, null, 2));
   return agentDir;
 }
+
+test('pi-sync-host recovers only still-pending prompts from the durable prompt queue', { timeout: 30_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-sync-host-queue-recover-'));
+  const laneRoot = join(root, 'lane');
+  const sessionFile = join(root, 'session.jsonl');
+  const sessionKey = 'queue-recover-test';
+  writeFileSync(sessionFile, '', 'utf8');
+  const brain = createControllableBrain();
+  const gateway = await createGateway({ brain: brain.brain });
+  const agentDir = writeAgentDir(root, gateway.port);
+  const syncDir = join(laneRoot, 'sessions', sessionKey, 'lanes', 'main', 'sync');
+  const promptQueuePath = join(syncDir, 'prompt-queue.jsonl');
+  const hostEventsPath = join(syncDir, 'host-events.jsonl');
+  mkdirSync(syncDir, { recursive: true });
+
+  appendJsonl(promptQueuePath, {
+    id: 'completed-prompt',
+    at: new Date().toISOString(),
+    source: 'pi-sync',
+    clientId: 'client-a',
+    lane: 'main',
+    text: 'SYNC_RECOVER_COMPLETED_SHOULD_NOT_REPLAY',
+    modelProvider: 'pi-mock',
+    modelId: 'mock',
+  });
+  appendJsonl(promptQueuePath, {
+    id: 'pending-prompt',
+    at: new Date().toISOString(),
+    source: 'pi-sync',
+    clientId: 'client-b',
+    lane: 'main',
+    text: 'SYNC_RECOVER_PENDING_PROMPT',
+    modelProvider: 'pi-mock',
+    modelId: 'mock',
+  });
+  appendJsonl(hostEventsPath, { type: 'prompt_queued', payload: { promptId: 'completed-prompt' } });
+  appendJsonl(hostEventsPath, { type: 'prompt_dequeued', payload: { promptId: 'completed-prompt' } });
+  appendJsonl(hostEventsPath, { type: 'prompt_end', payload: { promptId: 'completed-prompt' } });
+  appendJsonl(hostEventsPath, { type: 'prompt_queued', payload: { promptId: 'pending-prompt' } });
+
+  const child = spawn(process.execPath, [
+    HOST,
+    '--session-file', sessionFile,
+    '--session-key', sessionKey,
+    '--lane', 'main',
+  ], {
+    cwd: root,
+    env: {
+      ...process.env,
+      PI_CODING_AGENT_DIR: agentDir,
+      PI_LANE_ROOT: laneRoot,
+      PI_SYNC_HOST_IDLE_MS: '300',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  let stderr = '';
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+
+  try {
+    const call = await brain.waitForCall(10_000);
+    const request = JSON.stringify(call.request);
+    assert.match(request, /SYNC_RECOVER_PENDING_PROMPT/);
+    assert.doesNotMatch(request, /SYNC_RECOVER_COMPLETED_SHOULD_NOT_REPLAY/);
+    call.respond({ type: 'text', text: 'SYNC_RECOVER_PENDING_RESPONSE' });
+
+    await waitUntil(
+      () => readEvents(hostEventsPath).some((event) => event.type === 'prompt_queue_recovered' && event.payload?.recovered === 1),
+      10_000,
+      'prompt queue recovery event',
+    );
+    await waitUntil(
+      () => readFileSync(sessionFile, 'utf8').includes('SYNC_RECOVER_PENDING_RESPONSE'),
+      10_000,
+      'recovered prompt persisted response',
+    );
+    const result = await waitForExit(child, 10_000);
+    assert.deepEqual(result, { code: 0, signal: null });
+    assert.equal(stderr, '');
+  } finally {
+    if (child.exitCode === null) child.kill('SIGTERM');
+    await gateway.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test('pi-sync-host exits after idle timeout when no clients remain', { timeout: 10_000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-sync-host-idle-'));

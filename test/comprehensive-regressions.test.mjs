@@ -209,6 +209,60 @@ test('pi-sync recovers after the sync host dies mid-turn without duplicating old
   }
 });
 
+test('pi-sync recovers queued peer prompts after a sync host crash', { timeout: 120_000 }, async () => {
+  const { root, laneRoot, brain, a, b, sessionFile } = await createPair('pi-sync-host-queued-crash-', {
+    hostIdleMs: '5000',
+    env: {
+      PI_SYNC_HOST_LEASE_MS: '300',
+      PI_SYNC_HOST_RECONNECT_MS: '25',
+    },
+  });
+  try {
+    a.clearOutput();
+    b.clearOutput();
+    a.submit('SYNC_CRASH_QUEUE_ACTIVE_PROMPT');
+    await brain.waitForCall(TIMEOUT);
+    await b.waitForOutput('SYNC_CRASH_QUEUE_ACTIVE_PROMPT', TIMEOUT);
+
+    b.submit('SYNC_CRASH_QUEUE_PEER_PROMPT');
+    await waitUntil(() => {
+      const path = findPromptQueuePath(laneRoot, 'main');
+      return !!path && readFileSync(path, 'utf8').includes('SYNC_CRASH_QUEUE_PEER_PROMPT');
+    }, TIMEOUT, 'queued peer prompt before host crash');
+    assert.equal(brain.pending().length, 0, 'queued peer prompt should not start before the active prompt completes');
+
+    const firstHost = await waitUntil(() => readFreshHost(laneRoot, 'main')?.activePromptId && readFreshHost(laneRoot, 'main'), TIMEOUT, 'active host before queued crash');
+    process.kill(firstHost.pid, 'SIGKILL');
+    await waitUntil(() => !livePid(firstHost.pid), TIMEOUT, 'old queued-crash host process exit');
+
+    const queuedCall = await brain.waitForCall(TIMEOUT);
+    assert.match(JSON.stringify(queuedCall.request), /SYNC_CRASH_QUEUE_PEER_PROMPT/);
+    queuedCall.respond(text('SYNC_CRASH_QUEUE_PEER_RESPONSE'));
+
+    await a.waitForOutput('SYNC_CRASH_QUEUE_PEER_RESPONSE', TIMEOUT);
+    await b.waitForOutput('SYNC_CRASH_QUEUE_PEER_RESPONSE', TIMEOUT);
+
+    const replacementHost = await waitUntil(() => {
+      const host = readFreshHost(laneRoot, 'main');
+      return host?.pid && host.pid !== firstHost.pid && host;
+    }, TIMEOUT, 'replacement host after queued crash');
+    assert.notEqual(replacementHost.pid, firstHost.pid);
+
+    const queueEventsPath = findFiles(laneRoot, (path) => path.endsWith('/host-events.jsonl') && path.includes('/lanes/main/sync/'))[0];
+    assert.match(readFileSync(queueEventsPath, 'utf8'), /prompt_queue_recovered/);
+    assert.equal(readFileSync(sessionFile, 'utf8').match(/SYNC_CRASH_QUEUE_PEER_PROMPT/g)?.length, 1);
+    assert.equal(readFileSync(sessionFile, 'utf8').match(/SYNC_CRASH_QUEUE_PEER_RESPONSE/g)?.length, 1);
+
+    const screen = await b.visibleScreen();
+    assert.equal(countVisible(screen, 'SYNC_CRASH_QUEUE_PEER_PROMPT'), 1, screenText(screen));
+    assert.equal(countVisible(screen, 'SYNC_CRASH_QUEUE_PEER_RESPONSE'), 1, screenText(screen));
+  } finally {
+    await a.close();
+    await b.close();
+    await removeRoot(root);
+  }
+});
+
 test('pi-sync keeps active work alive when an attached peer closes, then shuts down after the final terminal closes', { timeout: 120_000 }, async () => {
   const { root, laneRoot, brain, a, b } = await createPair('pi-sync-close-active-', { hostIdleMs: '400' });
   try {
