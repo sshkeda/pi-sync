@@ -37,13 +37,13 @@ Two Pi terminals attached to the same session should behave like two views of on
 - host writes heartbeat/status to `~/.pi/lane/sessions/{sessionKey}/lanes/{sync}/sync/host.json`
 - host listens on a short macOS-safe Unix socket under `$TMPDIR/pi-sync-*.sock` and records host lifecycle/prompt queue events
 - host now owns `AgentSession` execution: normal terminal input is intercepted by attached UIs and forwarded to `pi-sync-host`
-- attached terminals replay host-owned native AgentSession events; terminal Pi processes are now UI clients for normal prompts
+- attached terminals replay host-owned native AgentSession events; terminal Pi processes are now UI clients for normal prompts, including interactive image attachments
 - explicit `-e/--extension` test/local extensions are propagated into the host via `PI_SYNC_HOST_EXTENSIONS`
 - uses the sync root/session key/sync channel as shared storage
 - appends live events to `~/.pi/lane/sessions/{sessionKey}/lanes/{sync}/sync/events.jsonl`
 - attached same-session/same-sync peers poll the bus and de-duplicate event IDs
-- with the `pi-sync` Pi core patch installed, peers replay remote agent events through `ctx.ui.replayAgentEvent(event)`, i.e. Pi's native interactive renderer
-- without the core patch, `pi-sync` fails during UI startup; native replay is a hard requirement, not a fallback path
+- with the `pi-sync` Pi core patch installed, peers replay remote agent events through `ctx.ui.replayAgentEvent(event)`, i.e. Pi's native interactive renderer, and request native redraws through `ctx.ui.requestRender()`
+- without the core patch, `pi-sync` fails during UI startup; native replay/requestRender support is a hard requirement, not a fallback path
 - late joiners replay from the current active turn's `turnStartOffset`
 - one active agent turn per session/sync channel is enforced with an atomic `turn.lock/owner.json` lease and heartbeat, with stale-lock recovery
 - competing attached-terminal input is published as `queued_input` and delivered by the active owner as a follow-up instead of starting a second peer model call

@@ -78,6 +78,57 @@
     ]
   },
   {
+    "id": "063-extension-ui-request-render-noop",
+    "file": "dist/core/extensions/runner.js",
+    "intent": "Expose a no-op ExtensionUIContext.requestRender in non-interactive modes so extensions can request a redraw through a typed API regardless of mode.",
+    "find": "    getToolsExpanded: () => false,\n    setToolsExpanded: () => { },\n    replayAgentEvent: async () => { },\n};",
+    "replace": "    getToolsExpanded: () => false,\n    setToolsExpanded: () => { },\n    replayAgentEvent: async () => { },\n    requestRender: () => { },\n};",
+    "verify": "requestRender: () => { },",
+    "occurrences": 1,
+    "references": [
+      {
+        "type": "consumer-repo",
+        "repo": "pi-sync",
+        "paths": ["index.ts"],
+        "reason": "pi-sync needs to request redraws after refreshing session state and lane markers without casting ctx.ui to private shapes."
+      }
+    ]
+  },
+  {
+    "id": "064-extension-ui-request-render-interactive",
+    "file": "dist/modes/interactive/interactive-mode.js",
+    "intent": "Expose ExtensionUIContext.requestRender in interactive mode by routing through the native TUI requestRender method.",
+    "find": "            replayAgentEvent: async (event, options = {}) => {\n                if (options.emitExtensions) await this.session.extensionRunner.emit(event);\n                await this.handleEvent(event);\n            },\n        };",
+    "replace": "            replayAgentEvent: async (event, options = {}) => {\n                if (options.emitExtensions) await this.session.extensionRunner.emit(event);\n                await this.handleEvent(event);\n            },\n            requestRender: () => this.ui.requestRender(),\n        };",
+    "verify": "requestRender: () => this.ui.requestRender(),",
+    "occurrences": 1,
+    "references": [
+      {
+        "type": "consumer-repo",
+        "repo": "pi-sync",
+        "paths": ["index.ts"],
+        "reason": "pi-sync refreshes native session state and lane markers from extension hooks and needs a typed redraw request."
+      }
+    ]
+  },
+  {
+    "id": "065-extension-ui-request-render-types",
+    "file": "dist/core/extensions/types.d.ts",
+    "intent": "Type ExtensionUIContext.requestRender so extensions can request a native UI redraw without local casts.",
+    "find": "    /** Replay an AgentSession event through the native UI renderer when available. */\n    replayAgentEvent(event: unknown, options?: { emitExtensions?: boolean }): Promise<void>;\n}",
+    "replace": "    /** Replay an AgentSession event through the native UI renderer when available. */\n    replayAgentEvent(event: unknown, options?: { emitExtensions?: boolean }): Promise<void>;\n    /** Request a native UI redraw when available. */\n    requestRender(): void;\n}",
+    "verify": "requestRender(): void;",
+    "occurrences": 1,
+    "references": [
+      {
+        "type": "consumer-repo",
+        "repo": "pi-sync",
+        "paths": ["index.ts"],
+        "reason": "Removes pi-sync local UI shape guesses for redraw requests."
+      }
+    ]
+  },
+  {
     "id": "070-tree-selector-live-markers",
     "file": "dist/modes/interactive/components/tree-selector.js",
     "intent": "Render non-persistent live tree markers from PI_SYNC_TREE_MARKERS before the active-path dot so synced terminals can show where live pi-sync lanes are pointed without writing labels into the session.",

@@ -15,7 +15,8 @@ import {
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, InputEvent, SessionTreeEvent } from "@earendil-works/pi-coding-agent";
+import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { Key, matchesKey, type AutocompleteItem } from "@earendil-works/pi-tui";
 import {
   DEFAULT_LANE,
@@ -82,6 +83,7 @@ type HostInfo = {
 
 type HostPrompt = {
   text: string;
+  images?: ImageContent[];
   lane: string;
   modelProvider?: string;
   modelId?: string;
@@ -155,8 +157,8 @@ function sessionId(ctx: ExtensionContext): string | null {
   return sessionManager(ctx)?.getSessionId?.() ?? null;
 }
 
-function nativeReplay(ctx: ExtensionContext): (event: unknown, options?: unknown) => unknown {
-  const replayAgentEvent = (ctx.ui as any)?.replayAgentEvent;
+function nativeReplay(ctx: ExtensionContext): (event: unknown, options?: { emitExtensions?: boolean }) => Promise<void> {
+  const replayAgentEvent = ctx.ui.replayAgentEvent;
   if (typeof replayAgentEvent !== "function") {
     throw new Error("pi-sync requires Pi native replay support: missing ctx.ui.replayAgentEvent. Apply/fix the pi-sync core Pi patch before loading pi-sync.");
   }
@@ -169,7 +171,7 @@ function refreshSessionFile(ctx: ExtensionContext): void {
   if (!file || !existsSync(file) || typeof sm?.setSessionFile !== "function") return;
   try {
     sm.setSessionFile(file);
-    (ctx.ui as any)?.requestRender?.();
+    ctx.ui.requestRender();
   } catch {
     // Best-effort. Native replay still keeps the UI live even if the session
     // manager implementation changes and cannot be refreshed here.
@@ -503,7 +505,7 @@ export default function piSync(pi: ExtensionAPI) {
   let isProcessingRemote = false;
   let processRemoteAgain = false;
   let queuedDrainTimer: ReturnType<typeof setTimeout> | undefined;
-  const pendingQueuedInputs: Array<{ text: string; images?: any[] }> = [];
+  const pendingQueuedInputs: Array<{ text: string; images?: ImageContent[] }> = [];
   const seenEventIds: string[] = [];
   const seenHostEventIds: string[] = [];
   const abortedHostPromptIds = new Set<string>();
@@ -718,7 +720,7 @@ export default function piSync(pi: ExtensionAPI) {
       }
       selectedTreeCursorEntryId = targetHead;
       updateTreeMarkers(sessionKey, activeSessionFile);
-      (ctx.ui as any)?.requestRender?.();
+      ctx.ui.requestRender();
     } catch {
       // Best-effort reconciliation. The next session refresh or tree
       // navigation will retry with the latest persisted lane state.
@@ -744,7 +746,7 @@ export default function piSync(pi: ExtensionAPI) {
     };
     writeJsonFile(instancePath(currentSessionKey, instanceId), state);
     const displayIdChanged = previousDisplayId !== (process.env.PI_LANE_CURRENT_LANE_ID ?? process.env.PI_SYNC_CHANNEL_ID);
-    if (displayIdChanged || updateTreeMarkers(currentSessionKey, file)) (ctx.ui as any)?.requestRender?.();
+    if (displayIdChanged || updateTreeMarkers(currentSessionKey, file)) ctx.ui.requestRender();
   }
 
   function readLaneInstances(sessionKey: string): InstanceState[] {
@@ -1067,9 +1069,9 @@ export default function piSync(pi: ExtensionAPI) {
     return {
       role: "assistant",
       content: [],
-      api: (ctx.model as any)?.api ?? "pi-sync",
-      provider: (ctx.model as any)?.provider ?? "pi-sync",
-      model: (ctx.model as any)?.id ?? (ctx.model as any)?.model ?? "unknown",
+      api: ctx.model?.api ?? "pi-sync",
+      provider: ctx.model?.provider ?? "pi-sync",
+      model: ctx.model?.id ?? "unknown",
       usage: {
         input: 0,
         output: 0,
@@ -1327,7 +1329,7 @@ export default function piSync(pi: ExtensionAPI) {
     });
   }
 
-  function sendHostPrompt(ctx: ExtensionContext, text: string): boolean {
+  function sendHostPrompt(ctx: ExtensionContext, text: string, images?: ImageContent[]): boolean {
     connectHost(ctx);
     hostAbortGraceStartedAt = Date.now();
     hostAbortGraceUntil = hostAbortGraceStartedAt + 1000;
@@ -1335,6 +1337,7 @@ export default function piSync(pi: ExtensionAPI) {
     const laneState = activeSessionKey ? readLaneState(activeSessionKey, lane) : undefined;
     const prompt: HostPrompt = {
       text,
+      images,
       lane,
       modelProvider: ctx.model?.provider,
       modelId: ctx.model?.id,
@@ -1362,14 +1365,14 @@ export default function piSync(pi: ExtensionAPI) {
     return true;
   }
 
-  function sendHostSteer(ctx: ExtensionContext, text: string): boolean {
+  function sendHostSteer(ctx: ExtensionContext, text: string, images?: ImageContent[]): boolean {
     connectHost(ctx);
     if (!hostSocket || hostSocket.destroyed) {
-      pendingHostPrompts.push({ text, lane: activeLane ?? currentLane(), modelProvider: ctx.model?.provider, modelId: ctx.model?.id });
+      pendingHostPrompts.push({ text, images, lane: activeLane ?? currentLane(), modelProvider: ctx.model?.provider, modelId: ctx.model?.id });
       scheduleHostReconnect(ctx);
       return true;
     }
-    hostSocket.write(JSON.stringify({ type: "steer", text, source: "pi-sync", clientId: instanceId }) + "\n");
+    hostSocket.write(JSON.stringify({ type: "steer", text, images, source: "pi-sync", clientId: instanceId }) + "\n");
     return true;
   }
 
@@ -2011,7 +2014,7 @@ export default function piSync(pi: ExtensionAPI) {
       const lane = readLane(activeSessionKey, laneName);
       const host = readHostInfo(activeSessionKey, laneName);
       const freshHost = isHostFresh(host) ? host : undefined;
-      const hasNativeReplay = typeof (ctx.ui as any).replayAgentEvent === "function";
+      const hasNativeReplay = typeof ctx.ui.replayAgentEvent === "function";
       ctx.ui.notify(
         `pi-sync: instance=${instanceId} sessionId=${sessionId(ctx) ?? "<none>"} sessionKey=${activeSessionKey} sync=${lane ? displayLane(activeSessionKey, lane) : laneName} nativeReplay=${hasNativeReplay ? "yes" : "no"} localOwnsTurn=${localOwnsTurn ? "yes" : "no"} activeOwner=${freshOwner?.instanceId ?? "<none>"} host=${freshHost ? `${freshHost.pid}/${freshHost.instanceId.slice(0, 8)}` : "<none>"} readOffset=${readOffset} events=${activeEventPath}`,
         "info",
@@ -2032,12 +2035,12 @@ export default function piSync(pi: ExtensionAPI) {
     publish(ctx, "attach", { sessionId: activeSessionId, sessionFile: activeSessionFile, sessionKey: activeSessionKey });
   });
 
-  pi.on("session_tree", async (event, ctx) => {
+  pi.on("session_tree", async (event: SessionTreeEvent, ctx) => {
     if (!ctx.hasUI) return;
     nativeReplay(ctx);
-    selectedTreeCursorEntryId = (event as any).newLeafId ?? sessionManager(ctx)?.getLeafId?.() ?? null;
+    selectedTreeCursorEntryId = event.newLeafId ?? sessionManager(ctx)?.getLeafId?.() ?? null;
     const file = sessionFile(ctx);
-    if (file) switchLaneForTreeSelection(ctx, file, selectedTreeCursorEntryId ?? null, (event as any).oldLeafId ?? null);
+    if (file) switchLaneForTreeSelection(ctx, file, selectedTreeCursorEntryId ?? null, event.oldLeafId ?? null);
     ensureActivePaths(ctx);
     startPolling(ctx);
     ensureHost(ctx);
@@ -2045,7 +2048,7 @@ export default function piSync(pi: ExtensionAPI) {
     publish(ctx, "attach", { sessionId: activeSessionId, sessionFile: activeSessionFile, sessionKey: activeSessionKey, lane: activeLane });
   });
 
-  pi.on("input", async (event, ctx) => {
+  pi.on("input", async (event: InputEvent, ctx) => {
     if (!ctx.hasUI || event.source !== "interactive") return undefined;
     nativeReplay(ctx);
     const selectedHeadEntryId = selectedTreeCursorEntryId;
@@ -2066,8 +2069,8 @@ export default function piSync(pi: ExtensionAPI) {
       connectHost(ctx);
       renderOptimisticUserMessage(ctx, event.text, "own");
       publish(ctx, "prompt_echo", { text: event.text });
-      if (hostIsMidTurn()) sendHostSteer(ctx, event.text);
-      else sendHostPrompt(ctx, event.text);
+      if (hostIsMidTurn()) sendHostSteer(ctx, event.text, event.images);
+      else sendHostPrompt(ctx, event.text, event.images);
       return { action: "handled" };
     }
     await waitForRemoteFlushBeforeLocalCommand(ctx);
@@ -2098,7 +2101,7 @@ export default function piSync(pi: ExtensionAPI) {
     const text = queued.map((item) => item.text).filter(Boolean).join("\n\n");
     const images = queued.flatMap((item) => item.images ?? []);
     if (!text.trim()) return;
-    const content = images.length > 0 ? ([{ type: "text", text }, ...images] as any) : text;
+    const content: string | (TextContent | ImageContent)[] = images.length > 0 ? [{ type: "text", text }, ...images] : text;
     try {
       pi.sendUserMessage(content);
     } catch {

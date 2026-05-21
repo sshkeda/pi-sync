@@ -640,7 +640,8 @@ function steerOwnership(agentEvent) {
 
 async function deliverSteer(payload) {
   const text = String(payload?.text ?? '');
-  if (!text.trim()) return;
+  const images = Array.isArray(payload?.images) ? payload.images : undefined;
+  if (!text.trim() && (!images || images.length === 0)) return;
   await initAgent();
   if (!agentSession || !activePrompt) {
     enqueuePrompt({ text, source: payload?.source, clientId: payload?.clientId });
@@ -648,7 +649,7 @@ async function deliverSteer(payload) {
   }
   try {
     recordPendingSteer(text, payload?.clientId ?? null);
-    await agentSession.steer(text);
+    await agentSession.steer(text, images);
     hostEvent('steer_delivered', { promptId: activePrompt.id, source: payload?.source ?? null, clientId: payload?.clientId ?? null, text });
   } catch (error) {
     hostEvent('steer_error', { promptId: activePrompt.id, message: error instanceof Error ? error.message : String(error), text });
@@ -660,7 +661,7 @@ function enqueuePrompt(payload) {
   const prompt = { id: randomUUID(), at: nowIso(), ...payload };
   pendingPrompts.push(prompt);
   appendJsonl(promptQueuePath, prompt);
-  hostEvent('prompt_queued', { promptId: prompt.id, source: prompt.source ?? null, clientId: prompt.clientId ?? null, lane: promptLaneName(prompt), laneHeadEntryId: promptLaneHead(prompt), modelProvider: prompt.modelProvider ?? null, modelId: prompt.modelId ?? null, text: prompt.text ?? '' });
+  hostEvent('prompt_queued', { promptId: prompt.id, source: prompt.source ?? null, clientId: prompt.clientId ?? null, lane: promptLaneName(prompt), laneHeadEntryId: promptLaneHead(prompt), modelProvider: prompt.modelProvider ?? null, modelId: prompt.modelId ?? null, text: prompt.text ?? '', images: Array.isArray(prompt.images) ? prompt.images.length : 0 });
   writeHostInfo();
   void pumpQueue();
 }
@@ -749,7 +750,7 @@ async function pumpQueue() {
     hostEvent('model_sync_end', { promptId: prompt.id, modelProvider: agentSession.model?.provider ?? null, modelId: agentSession.model?.id ?? null });
     hostEvent('prompt_start', { promptId: prompt.id, lane: promptLaneName(prompt), laneHeadEntryId, laneHeadSource: prompt.effectiveLaneHeadSource ?? null, modelProvider: agentSession.model?.provider ?? null, modelId: agentSession.model?.id ?? null, text: prompt.text ?? '' });
     writeHostInfo();
-    await agentSession.prompt(prompt.text ?? '', { source: 'extension' });
+    await agentSession.prompt(prompt.text ?? '', { source: 'extension', images: Array.isArray(prompt.images) ? prompt.images : undefined });
     await waitForAgentEventsDrained('prompt_complete');
     reconcileAgentTranscript('prompt_complete');
     flushHostSessionFile('prompt_complete');
@@ -790,8 +791,8 @@ const server = createServer((socket) => {
       let msg;
       try { msg = JSON.parse(line); } catch { socket.write(JSON.stringify({ type: 'error', error: 'invalid_json' }) + '\n'); continue; }
       if (msg.type === 'ping') socket.write(JSON.stringify({ type: 'pong', at: nowIso() }) + '\n');
-      else if (msg.type === 'prompt') enqueuePrompt({ text: String(msg.text ?? ''), source: msg.source, clientId: msg.clientId, lane: msg.lane, modelProvider: msg.modelProvider, modelId: msg.modelId, laneHeadEntryId: msg.laneHeadEntryId, laneHeadEpoch: msg.laneHeadEpoch, allowLaneHeadFork: msg.allowLaneHeadFork === true });
-      else if (msg.type === 'steer') void deliverSteer({ text: String(msg.text ?? ''), source: msg.source, clientId: msg.clientId });
+      else if (msg.type === 'prompt') enqueuePrompt({ text: String(msg.text ?? ''), images: Array.isArray(msg.images) ? msg.images : undefined, source: msg.source, clientId: msg.clientId, lane: msg.lane, modelProvider: msg.modelProvider, modelId: msg.modelId, laneHeadEntryId: msg.laneHeadEntryId, laneHeadEpoch: msg.laneHeadEpoch, allowLaneHeadFork: msg.allowLaneHeadFork === true });
+      else if (msg.type === 'steer') void deliverSteer({ text: String(msg.text ?? ''), images: Array.isArray(msg.images) ? msg.images : undefined, source: msg.source, clientId: msg.clientId });
       else if (msg.type === 'abort') void abortActive({ source: msg.source, clientId: msg.clientId });
       else if (msg.type === 'status') socket.write(JSON.stringify({ type: 'status', hostPath, socketPath, clients: clients.size, activePrompt, pendingPrompts: pendingPrompts.length }) + '\n');
       else if (msg.type === 'shutdown') shutdown('client_shutdown');
