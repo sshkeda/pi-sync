@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "shares": [
+    {
+      "name": "pi-background-tool",
+      "source": "~/gh/pi-background-tool",
+      "sourcePath": ".",
+      "targetPath": "third_party/pi-background-tool",
+      "include": [
+        "index.ts",
+        "LICENSE"
+      ],
+      "exclude": [],
+      "hash": "682f5d6cf268067158a13fb1a8553e629487722b143595c5862b6d84c674f41b",
+      "sourceHead": "64486472018af84f91a01ad98fc33c4c7a50561a",
+      "updatedAt": "2026-05-21T05:13:32.857Z"
+    },
+    {
+      "name": "pi-pending",
+      "source": "~/gh/pi-pending",
+      "sourcePath": ".",
+      "targetPath": "third_party/pi-pending",
+      "include": [
+        "index.ts",
+        "LICENSE"
+      ],
+      "exclude": [],
+      "hash": "783461cdf2c621e38045945ee609606a048316b05d57139045246c37a74476bc",
+      "sourceHead": "00afc7889f863938abc277393ac3c5e4b1f347ad",
+      "updatedAt": "2026-05-21T05:13:32.883Z"
+    }
+  ]
+}

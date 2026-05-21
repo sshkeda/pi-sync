@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "managedBy": "repo-share",
+  "name": "pi-pending",
+  "source": "~/gh/pi-pending",
+  "sourcePath": ".",
+  "targetPath": "third_party/pi-pending",
+  "sourceHead": "00afc7889f863938abc277393ac3c5e4b1f347ad",
+  "hash": "783461cdf2c621e38045945ee609606a048316b05d57139045246c37a74476bc",
+  "updatedAt": "2026-05-21T05:13:32.883Z",
+  "managedFiles": [
+    "LICENSE",
+    "index.ts"
+  ]
+}
