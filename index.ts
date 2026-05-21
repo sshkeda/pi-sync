@@ -165,19 +165,13 @@ function nativeReplay(ctx: ExtensionContext): (event: unknown, options?: { emitE
   return replayAgentEvent.bind(ctx.ui);
 }
 
-function requestNativeRender(ctx: ExtensionContext): void {
-  const requestRender = ctx.ui.requestRender;
-  if (typeof requestRender !== "function") return;
-  requestRender.call(ctx.ui);
-}
-
 function refreshSessionFile(ctx: ExtensionContext): void {
   const file = sessionFile(ctx);
   const sm = sessionManager(ctx);
   if (!file || !existsSync(file) || typeof sm?.setSessionFile !== "function") return;
   try {
     sm.setSessionFile(file);
-    requestNativeRender(ctx);
+    ctx.ui.requestRender();
   } catch {
     // Best-effort. Native replay still keeps the UI live even if the session
     // manager implementation changes and cannot be refreshed here.
@@ -726,7 +720,7 @@ export default function piSync(pi: ExtensionAPI) {
       }
       selectedTreeCursorEntryId = targetHead;
       updateTreeMarkers(sessionKey, activeSessionFile);
-      requestNativeRender(ctx);
+      ctx.ui.requestRender();
     } catch {
       // Best-effort reconciliation. The next session refresh or tree
       // navigation will retry with the latest persisted lane state.
@@ -752,7 +746,7 @@ export default function piSync(pi: ExtensionAPI) {
     };
     writeJsonFile(instancePath(currentSessionKey, instanceId), state);
     const displayIdChanged = previousDisplayId !== (process.env.PI_LANE_CURRENT_LANE_ID ?? process.env.PI_SYNC_CHANNEL_ID);
-    if (displayIdChanged || updateTreeMarkers(currentSessionKey, file)) requestNativeRender(ctx);
+    if (displayIdChanged || updateTreeMarkers(currentSessionKey, file)) ctx.ui.requestRender();
   }
 
   function readLaneInstances(sessionKey: string): InstanceState[] {
