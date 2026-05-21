@@ -1362,6 +1362,24 @@ export default function piSync(pi: ExtensionAPI) {
     return true;
   }
 
+  function sendHostSteer(ctx: ExtensionContext, text: string): boolean {
+    connectHost(ctx);
+    if (!hostSocket || hostSocket.destroyed) {
+      pendingHostPrompts.push({ text, lane: activeLane ?? currentLane(), modelProvider: ctx.model?.provider, modelId: ctx.model?.id });
+      scheduleHostReconnect(ctx);
+      return true;
+    }
+    hostSocket.write(JSON.stringify({ type: "steer", text, source: "pi-sync", clientId: instanceId }) + "\n");
+    return true;
+  }
+
+  function hostIsMidTurn(): boolean {
+    if (!activeSessionKey) return false;
+    const host = readHostInfo(activeSessionKey, activeLane ?? currentLane());
+    if (!isHostFresh(host)) return false;
+    return !!host.activePromptId;
+  }
+
   function hostHasActiveWork(): boolean {
     if (pendingHostPrompts.length > 0) return true;
     if (!activeSessionKey) return false;
@@ -2048,7 +2066,8 @@ export default function piSync(pi: ExtensionAPI) {
       connectHost(ctx);
       renderOptimisticUserMessage(ctx, event.text, "own");
       publish(ctx, "prompt_echo", { text: event.text });
-      sendHostPrompt(ctx, event.text);
+      if (hostIsMidTurn()) sendHostSteer(ctx, event.text);
+      else sendHostPrompt(ctx, event.text);
       return { action: "handled" };
     }
     await waitForRemoteFlushBeforeLocalCommand(ctx);

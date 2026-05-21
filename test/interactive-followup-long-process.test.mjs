@@ -48,7 +48,7 @@ function findPromptQueuePath(laneRoot, lane = 'main') {
   return candidates[0];
 }
 
-test('pi-sync queues an interactive follow-up while a long bash tool is still running', { timeout: 120_000 }, async () => {
+test('pi-sync steers an interactive follow-up into the active turn while a long bash tool is still running', { timeout: 120_000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-sync-long-followup-'));
   const laneRoot = join(root, 'lane');
   const sessionFile = join(root, 'shared.jsonl');
@@ -84,16 +84,9 @@ test('pi-sync queues an interactive follow-up while a long bash tool is still ru
     await waitUntil(() => existsSync(startedMarker), TIMEOUT, 'long bash process started');
 
     main.submit('SYNC_LONG_FOLLOWUP_PROMPT');
-    await waitUntil(
-      () => {
-        const promptQueuePath = findPromptQueuePath(laneRoot);
-        return !!promptQueuePath && readFileSync(promptQueuePath, 'utf8').includes('SYNC_LONG_FOLLOWUP_PROMPT');
-      },
-      TIMEOUT,
-      'interactive follow-up queued on host',
-    );
-    assert.equal(brain.pending().length, 0, 'follow-up must not start a competing model call while the long tool is running');
+    await main.waitForOutput('SYNC_LONG_FOLLOWUP_PROMPT', TIMEOUT);
     await attached.waitForOutput('SYNC_LONG_FOLLOWUP_PROMPT', TIMEOUT);
+    assert.equal(brain.pending().length, 0, 'steer must not start a competing model call while the long tool is running');
 
     await main.waitForOutput('SYNC_LONG_PROCESS_DONE', TIMEOUT);
     await attached.waitForOutput('SYNC_LONG_PROCESS_DONE', TIMEOUT);
@@ -101,18 +94,17 @@ test('pi-sync queues an interactive follow-up while a long bash tool is still ru
     const firstTurnContinuation = await brain.waitForCall(TIMEOUT);
     const firstTurnRequest = JSON.stringify(firstTurnContinuation.request);
     assert.match(firstTurnRequest, /SYNC_LONG_PROCESS_DONE/);
-    assert.doesNotMatch(firstTurnRequest, /SYNC_LONG_FOLLOWUP_PROMPT/, 'queued follow-up should not contaminate the in-flight tool-result continuation');
+    assert.match(firstTurnRequest, /SYNC_LONG_FOLLOWUP_PROMPT/, 'mid-turn steer must reach the active turn alongside the tool result');
     firstTurnContinuation.respond(text('SYNC_LONG_PROCESS_FINAL'));
 
     await main.waitForOutput('SYNC_LONG_PROCESS_FINAL', TIMEOUT);
     await attached.waitForOutput('SYNC_LONG_PROCESS_FINAL', TIMEOUT);
 
-    const followupCall = await brain.waitForCall(TIMEOUT);
-    assert.match(JSON.stringify(followupCall.request), /SYNC_LONG_FOLLOWUP_PROMPT/);
-    followupCall.respond(text('SYNC_LONG_FOLLOWUP_FINAL'));
+    const tail = await Promise.race([
+      brain.waitForCall(2_000).then((c) => c).catch(() => null),
+    ]);
+    assert.equal(tail, null, 'steered follow-up must not also fan out into a separate turn');
 
-    await main.waitForOutput('SYNC_LONG_FOLLOWUP_FINAL', TIMEOUT);
-    await attached.waitForOutput('SYNC_LONG_FOLLOWUP_FINAL', TIMEOUT);
     assert.doesNotMatch(`${main.output}\n${attached.output}`, /Agent is already processing a prompt|uncaughtException|prompt_error/);
   } finally {
     await main.close();

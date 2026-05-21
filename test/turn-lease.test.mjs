@@ -104,7 +104,7 @@ async function waitForMessageEntry(sessionFile, textValue, timeoutMs = TIMEOUT) 
   );
 }
 
-test('pi-sync queues competing same-session input instead of starting a peer model call', { timeout: 90_000 }, async () => {
+test('pi-sync steers competing same-session input into the active turn instead of starting a peer model call', { timeout: 90_000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-sync-lease-'));
   const laneRoot = join(root, 'lane');
   const sessionFile = join(root, 'shared.jsonl');
@@ -132,28 +132,21 @@ test('pi-sync queues competing same-session input instead of starting a peer mod
     b.clearOutput();
     a.submit('SYNC_FIRST_TURN');
     const firstCall = await brain.waitForCall(TIMEOUT);
+    await b.waitForOutput('SYNC_FIRST_TURN', TIMEOUT);
 
-    b.submit('SYNC_SECOND_TURN_SHOULD_QUEUE');
-    await waitUntil(
-      () => {
-        const promptQueuePath = findPromptQueuePath(laneRoot);
-        return !!promptQueuePath && readFileSync(promptQueuePath, 'utf8').includes('SYNC_SECOND_TURN_SHOULD_QUEUE');
-      },
-      TIMEOUT,
-      'host prompt queue entry',
-    );
-    assert.equal(brain.pending().length, 0, 'queued follower input should not start a competing peer model call');
+    b.submit('SYNC_SECOND_TURN_STEER');
+    await b.waitForOutput('SYNC_SECOND_TURN_STEER', TIMEOUT);
+    await a.waitForOutput('SYNC_SECOND_TURN_STEER', TIMEOUT);
+    assert.equal(brain.pending().length, 0, 'mid-turn peer steer should not start a competing peer model call');
     assert.doesNotMatch(b.output, /session is active in another attached terminal/, 'exact mode should not draw follower-only warning chrome');
 
     firstCall.respond(text('SYNC_FIRST_RESPONSE'));
-    await a.waitForOutput('SYNC_FIRST_RESPONSE', TIMEOUT);
-    await b.waitForOutput('SYNC_FIRST_RESPONSE', TIMEOUT);
 
     const secondCall = await brain.waitForCall(TIMEOUT);
     assert.match(
       JSON.stringify(secondCall.request),
-      /SYNC_SECOND_TURN_SHOULD_QUEUE/,
-      'queued follower input should run after the active prompt completes',
+      /SYNC_SECOND_TURN_STEER/,
+      'peer steer text must reach the still-active turn alongside the prior response',
     );
     secondCall.respond(text('SYNC_SECOND_RESPONSE'));
     await a.waitForOutput('SYNC_SECOND_RESPONSE', TIMEOUT);
@@ -241,27 +234,20 @@ export default function treeNavHelper(pi) {
     b.clearOutput();
     a.submit('SYNC_BRANCH_QUEUE_FIRST_TURN');
     const firstCall = await brain.waitForCall(TIMEOUT);
+    await b.waitForOutput('SYNC_BRANCH_QUEUE_FIRST_TURN', TIMEOUT);
 
-    b.submit('SYNC_BRANCH_QUEUE_SECOND_TURN_SHOULD_QUEUE');
-    await waitUntil(
-      () => {
-        const promptQueuePath = findPromptQueuePath(laneRoot);
-        return !!promptQueuePath && readFileSync(promptQueuePath, 'utf8').includes('SYNC_BRANCH_QUEUE_SECOND_TURN_SHOULD_QUEUE');
-      },
-      TIMEOUT,
-      'tree host prompt queue entry after tree navigation',
-    );
-    assert.equal(brain.pending().length, 0, 'queued input should not start a competing model call');
+    b.submit('SYNC_BRANCH_QUEUE_SECOND_TURN_STEER');
+    await b.waitForOutput('SYNC_BRANCH_QUEUE_SECOND_TURN_STEER', TIMEOUT);
+    await a.waitForOutput('SYNC_BRANCH_QUEUE_SECOND_TURN_STEER', TIMEOUT);
+    assert.equal(brain.pending().length, 0, 'peer steer on side lane should not start a competing model call');
 
     firstCall.respond(text('SYNC_BRANCH_QUEUE_FIRST_RESPONSE'));
-    await a.waitForOutput('SYNC_BRANCH_QUEUE_FIRST_RESPONSE', TIMEOUT);
-    await b.waitForOutput('SYNC_BRANCH_QUEUE_FIRST_RESPONSE', TIMEOUT);
 
     const secondCall = await brain.waitForCall(TIMEOUT);
     assert.match(
       JSON.stringify(secondCall.request),
-      /SYNC_BRANCH_QUEUE_SECOND_TURN_SHOULD_QUEUE/,
-      'queued branch input should run after active branch prompt completes',
+      /SYNC_BRANCH_QUEUE_SECOND_TURN_STEER/,
+      'side-lane peer steer must reach the active branch turn',
     );
     secondCall.respond(text('SYNC_BRANCH_QUEUE_SECOND_RESPONSE'));
     await a.waitForOutput('SYNC_BRANCH_QUEUE_SECOND_RESPONSE', TIMEOUT);

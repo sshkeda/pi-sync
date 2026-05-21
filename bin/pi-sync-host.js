@@ -564,11 +564,12 @@ async function initAgent() {
     });
     agentSession = created.session;
     agentSession.subscribe((agentEvent) => {
+      const steerClientId = steerOwnership(agentEvent);
       hostEvent('agent_event', {
         agentEvent,
         promptId: activePrompt?.id ?? null,
-        clientId: activePrompt?.clientId ?? null,
-        source: activePrompt?.source ?? null,
+        clientId: steerClientId ?? activePrompt?.clientId ?? null,
+        source: steerClientId ? 'pi-sync-steer' : (activePrompt?.source ?? null),
       });
     });
     agentReady = true;
@@ -606,6 +607,52 @@ async function ensurePromptModel(prompt) {
     previousProvider: current?.provider ?? null,
     previousModelId: current?.id ?? null,
   });
+}
+
+// Tracks which client originated each in-flight steered user message so that
+// the agent's eventual user_message event can be attributed back to that
+// client (not the active prompt's submitter) for cross-terminal dedup.
+const pendingSteers = new Map();
+function recordPendingSteer(text, clientId) {
+  if (!clientId) return;
+  const queue = pendingSteers.get(text) ?? [];
+  queue.push(clientId);
+  pendingSteers.set(text, queue);
+}
+function steerOwnership(agentEvent) {
+  if (agentEvent?.type !== 'message_start' && agentEvent?.type !== 'message_end') return undefined;
+  if (agentEvent?.message?.role !== 'user') return undefined;
+  const content = agentEvent.message.content;
+  const text = typeof content === 'string'
+    ? content
+    : Array.isArray(content)
+      ? content.filter((p) => p?.type === 'text' && typeof p.text === 'string').map((p) => p.text).join('')
+      : '';
+  const queue = pendingSteers.get(text);
+  if (!queue || queue.length === 0) return undefined;
+  if (agentEvent.type === 'message_end') {
+    const clientId = queue.shift();
+    if (queue.length === 0) pendingSteers.delete(text);
+    return clientId;
+  }
+  return queue[0];
+}
+
+async function deliverSteer(payload) {
+  const text = String(payload?.text ?? '');
+  if (!text.trim()) return;
+  await initAgent();
+  if (!agentSession || !activePrompt) {
+    enqueuePrompt({ text, source: payload?.source, clientId: payload?.clientId });
+    return;
+  }
+  try {
+    recordPendingSteer(text, payload?.clientId ?? null);
+    await agentSession.steer(text);
+    hostEvent('steer_delivered', { promptId: activePrompt.id, source: payload?.source ?? null, clientId: payload?.clientId ?? null, text });
+  } catch (error) {
+    hostEvent('steer_error', { promptId: activePrompt.id, message: error instanceof Error ? error.message : String(error), text });
+  }
 }
 
 function enqueuePrompt(payload) {
@@ -744,6 +791,7 @@ const server = createServer((socket) => {
       try { msg = JSON.parse(line); } catch { socket.write(JSON.stringify({ type: 'error', error: 'invalid_json' }) + '\n'); continue; }
       if (msg.type === 'ping') socket.write(JSON.stringify({ type: 'pong', at: nowIso() }) + '\n');
       else if (msg.type === 'prompt') enqueuePrompt({ text: String(msg.text ?? ''), source: msg.source, clientId: msg.clientId, lane: msg.lane, modelProvider: msg.modelProvider, modelId: msg.modelId, laneHeadEntryId: msg.laneHeadEntryId, laneHeadEpoch: msg.laneHeadEpoch, allowLaneHeadFork: msg.allowLaneHeadFork === true });
+      else if (msg.type === 'steer') void deliverSteer({ text: String(msg.text ?? ''), source: msg.source, clientId: msg.clientId });
       else if (msg.type === 'abort') void abortActive({ source: msg.source, clientId: msg.clientId });
       else if (msg.type === 'status') socket.write(JSON.stringify({ type: 'status', hostPath, socketPath, clients: clients.size, activePrompt, pendingPrompts: pendingPrompts.length }) + '\n');
       else if (msg.type === 'shutdown') shutdown('client_shutdown');
