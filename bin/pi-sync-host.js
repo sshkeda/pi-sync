@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createServer } from 'node:net';
 import { createHash, randomUUID } from 'node:crypto';
-import { appendFileSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 
@@ -475,6 +475,20 @@ function shouldLoadInHost(entry) {
   return !HOST_EXTENSION_EXCLUDE_RE.test(source);
 }
 
+// Node's rmSync({ force: true }) silently fails to remove broken symlinks on
+// macOS, leaving the stale link behind so the next symlinkSync hits EEXIST.
+// Use lstat + unlinkSync for any path that might be a symlink; fall back to
+// recursive rmSync only when the target is a real directory.
+function removeAnySync(path) {
+  let st;
+  try { st = lstatSync(path); } catch (error) { if (error?.code === 'ENOENT') return; throw error; }
+  if (st.isSymbolicLink() || !st.isDirectory()) {
+    unlinkSync(path);
+    return;
+  }
+  rmSync(path, { recursive: true, force: true });
+}
+
 function prepareHostAgentDir(agentDir) {
   if (!agentDir) return undefined;
   const hostAgentDir = join(sessionRoot, 'host-agent');
@@ -489,7 +503,7 @@ function prepareHostAgentDir(agentDir) {
     const source = join(agentDir, name);
     const target = join(hostAgentDir, name);
     try {
-      rmSync(target, { force: true });
+      removeAnySync(target);
       if (existsSync(source)) symlinkSync(source, target);
     } catch {
       try { if (existsSync(source)) copyFileSync(source, target); } catch {}
@@ -499,7 +513,7 @@ function prepareHostAgentDir(agentDir) {
     const source = join(agentDir, name);
     const target = join(hostAgentDir, name);
     try {
-      rmSync(target, { recursive: true, force: true });
+      removeAnySync(target);
       if (existsSync(source)) symlinkSync(source, target);
     } catch {}
   }
@@ -520,7 +534,7 @@ function installExtraHostExtensions(agentDir) {
   mkdirSync(extDir, { recursive: true });
   extras.forEach((ext, index) => {
     const target = join(extDir, `pi-sync-host-extra-${index}.js`);
-    try { rmSync(target, { force: true }); } catch {}
+    try { removeAnySync(target); } catch {}
     try { symlinkSync(ext, target); } catch {}
   });
 }
