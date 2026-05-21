@@ -1,11 +1,13 @@
 import nodeTest from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdtempSync, realpathSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInteractiveMock, createControllableBrain, script, text } from '../../pi-mock/dist/index.js';
 
 const EXTENSION = new URL('../index.ts', import.meta.url).pathname;
+const STATUS_EXTENSION = new URL('../../pi-status-line/index.ts', import.meta.url).pathname;
 const TIMEOUT = 30_000;
 let testChain = Promise.resolve();
 
@@ -25,6 +27,10 @@ function test(name, options, fn) {
 
 function countVisible(lines, needle) {
   return lines.filter((line) => line.includes(needle)).length;
+}
+
+function stableSessionKey(sessionFile) {
+  return createHash('sha256').update(sessionFile).digest('hex').slice(0, 24);
 }
 
 function readSessionEntries(sessionFile) {
@@ -127,6 +133,44 @@ function readLaneStates(laneRoot) {
       .filter((item) => item.endsWith('.json'))
       .map((item) => JSON.parse(readFileSync(join(lanesDir, item), 'utf8')));
   });
+}
+
+function writeLaneFixture(laneRoot, sessionKey, sessionFile, lane) {
+  const now = new Date().toISOString();
+  mkdirSync(join(laneRoot, 'sessions', sessionKey, 'lanes'), { recursive: true });
+  mkdirSync(join(laneRoot, 'flat'), { recursive: true });
+  const displayId = lane.displayId ?? 'L1';
+  const state = {
+    schemaVersion: 1,
+    name: lane.name,
+    sessionKey,
+    baseLeafId: lane.baseLeafId ?? null,
+    headEntryId: lane.headEntryId ?? null,
+    headEpoch: lane.headEpoch ?? 0,
+    createdAt: lane.createdAt ?? now,
+    updatedAt: lane.updatedAt ?? now,
+    id: lane.id ?? `${sessionKey.slice(0, 8)}-${displayId}`,
+    displayId,
+    aliasPath: lane.aliasPath ?? join(laneRoot, 'flat', `${sessionKey.slice(0, 8)}-${displayId}.json`),
+  };
+  writeFileSync(join(laneRoot, 'sessions', sessionKey, 'lanes', `${lane.name}.json`), JSON.stringify(state, null, 2), 'utf8');
+}
+
+function writeInstanceFixture(laneRoot, sessionKey, sessionFile, instance) {
+  const now = new Date().toISOString();
+  mkdirSync(join(laneRoot, 'sessions', sessionKey, 'instances'), { recursive: true });
+  writeFileSync(join(laneRoot, 'sessions', sessionKey, 'instances', `${instance.instanceId}.json`), JSON.stringify({
+    instanceId: instance.instanceId,
+    pid: instance.pid ?? process.pid,
+    lane: instance.lane,
+    status: instance.status ?? 'idle',
+    sessionId: instance.sessionId ?? null,
+    sessionKey,
+    sessionFile,
+    leafId: instance.leafId ?? null,
+    startedAt: instance.startedAt ?? now,
+    lastSeenAt: instance.lastSeenAt ?? now,
+  }, null, 2), 'utf8');
 }
 
 function findHostJsons(dir) {
@@ -629,9 +673,9 @@ export default function treeNavHelper(pi) {
     b.submit('/_tree_nav_to_text SYNC_TREE_BASE_ANSWER');
     await b.waitForOutput('leaf_after_nav:', TIMEOUT);
     b.submit('/sync status');
-    await b.waitForOutput(/sync=tree-/, TIMEOUT);
+    await b.waitForOutput(/sync=~\/2 ln_[A-Za-z0-9_-]+/, TIMEOUT);
     a.submit('/sync status');
-    await a.waitForOutput(/sync=main/, TIMEOUT);
+    await a.waitForOutput(/sync=~\/1 ln_[A-Za-z0-9_-]+/, TIMEOUT);
 
     a.clearOutput();
     b.clearOutput();
@@ -644,7 +688,7 @@ export default function treeNavHelper(pi) {
     const sessionDirs = readdirSync(join(laneRoot, 'sessions'));
     const lanes = sessionDirs.flatMap((sessionDir) => readdirSync(join(laneRoot, 'sessions', sessionDir, 'lanes')));
     assert.ok(lanes.includes('main.json'), lanes.join('\n'));
-    assert.ok(lanes.some((item) => item.startsWith('tree-') && item.endsWith('.json')), lanes.join('\n'));
+    assert.ok(lanes.some((item) => item.startsWith('ln_') && item.endsWith('.json')), lanes.join('\n'));
 
     const baseAnswer = findMessageEntry(sessionFile, 'SYNC_TREE_BASE_ANSWER');
     const secondAnswer = findMessageEntry(sessionFile, 'SYNC_TREE_SECOND_ANSWER');
@@ -654,7 +698,7 @@ export default function treeNavHelper(pi) {
     const branchAnswer = findMessageEntry(sessionFile, 'SYNC_TREE_BRANCH_ANSWER');
     const states = readLaneStates(laneRoot);
     const mainLane = states.find((item) => item.name === 'main');
-    const treeLane = states.find((item) => item.name?.startsWith('tree-'));
+    const treeLane = states.find((item) => item.name !== 'main');
     assert.equal(mainLane?.headEntryId, secondAnswer.id, 'main lane head should stay on the original main tail');
     assert.equal(treeLane?.baseLeafId, baseAnswer.id, 'tree lane should be based at the selected tree leaf');
     assert.equal(treeLane?.headEntryId, branchAnswer.id, 'tree lane head should advance with the branch response');
@@ -737,9 +781,9 @@ export default function treeNavHelper(pi) {
     }
     await branch.waitForOutput('leaf_after_nav:', TIMEOUT);
     branch.submit('/sync status');
-    await branch.waitForOutput(/sync=tree-/, TIMEOUT);
+    await branch.waitForOutput(/sync=~\/2 ln_[A-Za-z0-9_-]+/, TIMEOUT);
     main.submit('/sync status');
-    await main.waitForOutput(/sync=main/, TIMEOUT);
+    await main.waitForOutput(/sync=~\/1 ln_[A-Za-z0-9_-]+/, TIMEOUT);
 
     main.clearOutput();
     branch.clearOutput();
@@ -751,7 +795,7 @@ export default function treeNavHelper(pi) {
     await waitForMessageEntries(sessionFile, 'SYNC_ALT_BRANCH_ONE_ANSWER');
     await waitUntil(
       () => {
-        const treeLane = readLaneStates(laneRoot).find((item) => item.name?.startsWith('tree-'));
+        const treeLane = readLaneStates(laneRoot).find((item) => item.name !== 'main');
         if (!treeLane) return false;
         const branchOneAnswers = findMessageEntries(sessionFile, 'SYNC_ALT_BRANCH_ONE_ANSWER');
         return branchOneAnswers.some((entry) => treeLane.headEntryId === entry.id);
@@ -767,7 +811,7 @@ export default function treeNavHelper(pi) {
     await waitForMessageEntries(sessionFile, 'SYNC_ALT_BRANCH_TWO_ANSWER');
     await waitUntil(
       () => {
-        const treeLane = readLaneStates(laneRoot).find((item) => item.name?.startsWith('tree-'));
+        const treeLane = readLaneStates(laneRoot).find((item) => item.name !== 'main');
         if (!treeLane) return false;
         const branchTwoAnswers = findMessageEntries(sessionFile, 'SYNC_ALT_BRANCH_TWO_ANSWER');
         return branchTwoAnswers.some((entry) => treeLane.headEntryId === entry.id);
@@ -810,7 +854,7 @@ export default function treeNavHelper(pi) {
     assert.ok(mainLanePath, 'expected main lane state file');
     const mainLane = JSON.parse(readFileSync(mainLanePath, 'utf8'));
     assert.equal(mainLane.headEntryId, mainAfterBranchAnswer.id, 'main lane head should advance along the main path');
-    const treeLane = readLaneStates(laneRoot).find((item) => item.name?.startsWith('tree-'));
+    const treeLane = readLaneStates(laneRoot).find((item) => item.name !== 'main');
     assert.ok(treeLane, 'expected auto tree lane state');
     assert.ok(branchTwoAnswers.some((entry) => treeLane.headEntryId === entry.id), 'tree lane head should remain on latest tree branch');
     assertNoHiddenBranchLanes(laneRoot);
@@ -918,10 +962,10 @@ export default function treeHeadHelper(pi) {
     b.submit('/_tree_nav_to_text SYNC_MARKER_BASE_ANSWER');
     await b.waitForOutput('leaf_after_nav:', TIMEOUT);
     b.submit('/lane status');
-    await b.waitForOutput(/current 2 \(tree-/, TIMEOUT);
+    await b.waitForOutput(/current ~\/2 ln_[A-Za-z0-9_-]+/, TIMEOUT);
 
     a.submit('/lane join 2');
-    await a.waitForOutput(/joined 1 \(tree-/, TIMEOUT);
+    await a.waitForOutput(/joined ln_[A-Za-z0-9_-]+ -> now ~\/1 ln_[A-Za-z0-9_-]+/, TIMEOUT);
     a.clearOutput();
     a.submit('/_leaf_text');
     await a.waitForOutput('leaf_text:SYNC_MARKER_BASE_ANSWER', TIMEOUT);
@@ -1055,12 +1099,14 @@ export default function treeNavHelper(pi) {
     await waitUntilQuiet(async () => !(await visibleText(mock)).includes('Session Tree'), TIMEOUT);
     mock.clearOutput();
     mock.submit('/lane identity');
-    await mock.waitForOutput(/laneId=L1/, TIMEOUT);
-    assert.doesNotMatch(mock.output, /laneId=L2/, mock.output);
+    await mock.waitForOutput(/lane=~\/1 ln_[A-Za-z0-9_-]+/, TIMEOUT);
+    assert.doesNotMatch(mock.output, /lane=~\/2/, mock.output);
 
     mock.clearOutput();
-    mock.submit('/lane join main');
-    await mock.waitForOutput(/joined .*main/, TIMEOUT);
+    const mainLane = readLaneStates(laneRoot).find((item) => item.name === 'main');
+    assert.ok(mainLane?.id, 'expected canonical id for initial lane');
+    mock.submit(`/lane join ${mainLane.id}`);
+    await mock.waitForOutput(/joined ln_[A-Za-z0-9_-]+ -> now ~\/1 ln_[A-Za-z0-9_-]+/, TIMEOUT);
     mock.clearOutput();
     mock.submit('/_tree_markers');
     await mock.waitForOutput(/1:SYNC_DISPLAY_THREE_ANSWER/, TIMEOUT);
@@ -1077,9 +1123,8 @@ export default function treeNavHelper(pi) {
     await mock.waitForOutput('leaf_after_nav:', TIMEOUT);
     mock.clearOutput();
     mock.submit('/lane identity');
-    await mock.waitForOutput(/laneId=L1/, TIMEOUT);
-    assert.doesNotMatch(mock.output, /laneId=L2/, mock.output);
-    assert.doesNotMatch(mock.output, /laneId=L3/, mock.output);
+    await mock.waitForOutput(/lane=~\/1 ln_[A-Za-z0-9_-]+/, TIMEOUT);
+    assert.doesNotMatch(mock.output, /lane=~\/2|lane=~\/3/, mock.output);
   } finally {
     await mock.close();
     await removeRoot(root);
@@ -1163,8 +1208,8 @@ export default function treeNavHelper(pi) {
 
     branch.clearOutput();
     branch.submit('/lane identity');
-    await branch.waitForOutput(/laneId=L1/, TIMEOUT);
-    assert.doesNotMatch(branch.output, /laneId=L2/, branch.output);
+    await branch.waitForOutput(/lane=~\/1 ln_[A-Za-z0-9_-]+/, TIMEOUT);
+    assert.doesNotMatch(branch.output, /lane=~\/2/, branch.output);
 
     branch.clearOutput();
     branch.submit('/tree');
@@ -1272,6 +1317,89 @@ test('pi-sync marks the current single-lane assistant row in the session tree', 
   }
 });
 
+test('pi-sync reconciles a stale loaded lane head to the actual resumed leaf before painting tree markers', { timeout: 90_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-sync-resume-stale-head-marker-'));
+  const laneRoot = join(root, 'lane');
+  const sessionFile = join(root, 'shared.jsonl');
+  const piWrapper = join(root, 'pi-wrapper.sh');
+  const helperExt = join(root, 'resume-stale-head-helper.mjs');
+  writeFileSync(sessionFile, [
+    JSON.stringify({ type: 'session', version: 3, id: 'resume-stale-head-session', timestamp: new Date().toISOString(), cwd: root }),
+    JSON.stringify({ type: 'message', id: 'old-user-entry', parentId: null, timestamp: new Date().toISOString(), message: { role: 'user', content: [{ type: 'text', text: 'SYNC_RESUME_OLD_PROMPT' }] } }),
+    JSON.stringify({ type: 'message', id: 'old-assistant-entry', parentId: 'old-user-entry', timestamp: new Date().toISOString(), message: { role: 'assistant', content: [{ type: 'text', text: 'SYNC_RESUME_OLD_ANSWER' }], stopReason: 'stop', usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }),
+    JSON.stringify({ type: 'message', id: 'new-user-entry', parentId: null, timestamp: new Date().toISOString(), message: { role: 'user', content: [{ type: 'text', text: 'SYNC_RESUME_NEW_PROMPT' }] } }),
+    JSON.stringify({ type: 'message', id: 'new-assistant-entry', parentId: 'new-user-entry', timestamp: new Date().toISOString(), message: { role: 'assistant', content: [{ type: 'text', text: 'SYNC_RESUME_NEW_ANSWER' }], stopReason: 'stop', usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }),
+    JSON.stringify({ type: 'thinking_level_change', id: 'new-hidden-tail', parentId: 'new-assistant-entry', timestamp: new Date().toISOString(), thinkingLevel: 'off' }),
+    '',
+  ].join('\n'), 'utf8');
+  const canonicalSessionFile = realpathSync(sessionFile);
+  const sessionKey = stableSessionKey(canonicalSessionFile);
+  writeLaneFixture(laneRoot, sessionKey, canonicalSessionFile, {
+    name: 'main',
+    id: 'ln_staleh1',
+    displayId: 'L1',
+    headEntryId: 'old-assistant-entry',
+  });
+  writeFileSync(helperExt, `
+export default function resumeStaleHeadHelper(pi) {
+  pi.registerCommand("_tree_markers", {
+    description: "Print pi-sync tree marker env",
+    handler: async (_args, ctx) => {
+      const raw = process.env.PI_SYNC_TREE_MARKERS || "";
+      let readable = "";
+      try {
+        const markers = JSON.parse(raw || "{}");
+        readable = Object.entries(markers).map(([id, label]) => {
+          const entry = ctx.sessionManager.getEntries().find((item) => item.id === id);
+          const content = entry?.message?.content;
+          const text = Array.isArray(content)
+            ? content.filter((part) => part?.type === "text").map((part) => part.text).join("")
+            : "";
+          return label + ":" + text;
+        }).join("|");
+      } catch {}
+      ctx.ui.notify("tree_markers:" + (raw || "<empty>") + " readable:" + readable, "info");
+    },
+  });
+}
+`, 'utf8');
+  writeFileSync(piWrapper, `#!/usr/bin/env bash\nargs=()\nfor a in "$@"; do [[ "$a" == "--no-session" ]] && continue; args+=("$a"); done\nexec "${process.env.PI_SYNC_TEST_PI_BINARY ?? 'pi'}" "\${args[@]}"\n`);
+  chmodSync(piWrapper, 0o755);
+
+  const mock = await createInteractiveMock({
+    brain: script(text('UNUSED_RESUME_STALE_HEAD_RESPONSE')),
+    extensions: [EXTENSION, STATUS_EXTENSION, helperExt],
+    piProvider: 'pi-mock',
+    piModel: 'mock',
+    startupTimeoutMs: 20_000,
+    terminal: { cols: 140, rows: 34 },
+    cwd: root,
+    env: { PI_LANE_ROOT: laneRoot, PI_SYNC_POLL_MS: '25', PI_SYNC_HOST_IDLE_MS: '1000' },
+    piBinary: piWrapper,
+    piArgs: ['--session', sessionFile],
+  });
+
+  try {
+    await mock.waitForOutput('SYNC_RESUME_NEW_ANSWER', TIMEOUT);
+    await waitForVisibleText(mock, /~\/1\b/, TIMEOUT, 'resumed terminal footer is live lane 1');
+    mock.clearOutput();
+    mock.submit('/tree');
+    const newLine = await waitForVisibleLine(mock, 'assistant: SYNC_RESUME_NEW_ANSWER', TIMEOUT, 'resumed leaf marker follows current assistant');
+    assert.match(newLine.line, /\b1\b/, newLine.screen);
+    const oldLine = lineContaining(newLine.screen, 'assistant: SYNC_RESUME_OLD_ANSWER');
+    assert.doesNotMatch(oldLine, /\b1\b/, newLine.screen);
+    mock.sendKey('escape');
+    await waitUntilQuiet(async () => !(await visibleText(mock)).includes('Session Tree'), TIMEOUT);
+    mock.clearOutput();
+    mock.submit('/_tree_markers');
+    await mock.waitForOutput(/readable:1:SYNC_RESUME_NEW_ANSWER/, TIMEOUT);
+    assert.doesNotMatch(mock.output, /readable:1:SYNC_RESUME_OLD_ANSWER/, mock.output);
+  } finally {
+    await mock.close();
+    await removeRoot(root);
+  }
+});
+
 test('pi-sync marks a root-position lane on the first root message row', { timeout: 90_000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-sync-root-tree-marker-'));
   const laneRoot = join(root, 'lane');
@@ -1325,7 +1453,7 @@ export default function rootTreeHelper(pi) {
     mock.clearOutput();
     mock.submit('/_tree_nav_to_text SYNC_ROOT_TREE_MARKER_PROMPT');
     await waitUntil(
-      () => readLaneStates(laneRoot).some((lane) => lane.name === 'tree-root' && lane.headEntryId === null),
+      () => readLaneStates(laneRoot).some((lane) => lane.name !== 'main' && (lane.headEntryId === null || lane.headEntryId === 'root-user-entry')),
       TIMEOUT,
       'root lane state after navigating to first user message',
     );
@@ -1342,7 +1470,7 @@ export default function rootTreeHelper(pi) {
   }
 });
 
-test('pi-sync shows multiple live lanes on the same visible tree row', { timeout: 90_000 }, async () => {
+test('pi-sync updates open tree markers as same-row live lanes attach and detach', { timeout: 120_000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-sync-same-row-markers-'));
   const laneRoot = join(root, 'lane');
   const sessionFile = join(root, 'shared.jsonl');
@@ -1390,16 +1518,222 @@ test('pi-sync shows multiple live lanes on the same visible tree row', { timeout
 
     laneCreator.clearOutput();
     laneCreator.submit('/lane new');
-    await laneCreator.waitForOutput(/created and joined 2 \(lane-2\)/, TIMEOUT);
+    await laneCreator.waitForOutput(/created ln_[A-Za-z0-9_-]+ -> now ~\/2 ln_[A-Za-z0-9_-]+/, TIMEOUT);
 
     await waitUntil(async () => {
       const screen = await visibleText(treeViewer);
       const line = lineContaining(screen, 'assistant: SYNC_SAME_ROW_ANSWER');
       return /\b1,2\b/.test(line) && !/\b3\b/.test(line);
     }, TIMEOUT, 'open tree marker updates to 1,2 for two live lanes on one row');
+
+    await laneCreator.close();
+
+    await waitUntil(async () => {
+      const screen = await visibleText(treeViewer);
+      const line = lineContaining(screen, 'assistant: SYNC_SAME_ROW_ANSWER');
+      return /\b1\b/.test(line) && !/\b2\b/.test(line) && !/\b1,2\b/.test(line);
+    }, TIMEOUT, 'open tree marker compacts back to 1 after peer lane detaches');
   } finally {
     await treeViewer.close();
     await laneCreator.close();
+    await removeRoot(root);
+  }
+});
+
+test('pi-sync rerenders the footer when live lane labels renumber', { timeout: 90_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-sync-footer-renumber-'));
+  const laneRoot = join(root, 'lane');
+  const sessionFile = join(root, 'shared.jsonl');
+  const piWrapper = join(root, 'pi-wrapper.sh');
+  writeFileSync(sessionFile, [
+    JSON.stringify({ type: 'session', version: 3, id: 'footer-renumber-session', timestamp: new Date().toISOString(), cwd: root }),
+    JSON.stringify({ type: 'message', id: 'footer-user', parentId: null, timestamp: new Date().toISOString(), message: { role: 'user', content: [{ type: 'text', text: 'SYNC_FOOTER_RENUMBER_PROMPT' }] } }),
+    JSON.stringify({ type: 'message', id: 'footer-assistant', parentId: 'footer-user', timestamp: new Date().toISOString(), message: { role: 'assistant', content: [{ type: 'text', text: 'SYNC_FOOTER_RENUMBER_ANSWER' }], stopReason: 'stop', usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }),
+    '',
+  ].join('\n'), 'utf8');
+  writeFileSync(piWrapper, `#!/usr/bin/env bash\nargs=()\nfor a in "$@"; do [[ "$a" == "--no-session" ]] && continue; args+=("$a"); done\nexec "${process.env.PI_SYNC_TEST_PI_BINARY ?? 'pi'}" "\${args[@]}"\n`);
+  chmodSync(piWrapper, 0o755);
+
+  const common = {
+    brain: script(text('UNUSED_FOOTER_RENUMBER_RESPONSE')),
+    extensions: [EXTENSION, STATUS_EXTENSION],
+    piProvider: 'pi-mock',
+    piModel: 'mock',
+    startupTimeoutMs: 20_000,
+    terminal: { cols: 140, rows: 34 },
+    cwd: root,
+    env: {
+      PI_LANE_ROOT: laneRoot,
+      PI_SYNC_POLL_MS: '25',
+      PI_SYNC_HOST_IDLE_MS: '1000',
+      PI_LANE_HEARTBEAT_MS: '100',
+      PI_SYNC_INSTANCE_STALE_MS: '5000',
+    },
+    piBinary: piWrapper,
+    piArgs: ['--session', sessionFile],
+  };
+
+  const branch = await createInteractiveMock(common);
+  let main;
+  try {
+    await branch.waitForOutput('SYNC_FOOTER_RENUMBER_ANSWER', TIMEOUT);
+    branch.clearOutput();
+    branch.submit('/lane new');
+    await branch.waitForOutput(/created ln_[A-Za-z0-9_-]+ -> now ~\/1 ln_[A-Za-z0-9_-]+/, TIMEOUT);
+    await waitForVisibleText(branch, /~\/1\b/, TIMEOUT, 'branch lane is compacted to ~/1 while it is the only live terminal');
+
+    main = await createInteractiveMock(common);
+    await main.waitForOutput('SYNC_FOOTER_RENUMBER_ANSWER', TIMEOUT);
+
+    await waitForVisibleText(branch, /~\/2\b/, TIMEOUT, 'branch footer rerenders to ~/2 when main becomes a live lane');
+    branch.clearOutput();
+    branch.submit('/tree');
+    const currentLine = await waitForVisibleLine(branch, 'assistant: SYNC_FOOTER_RENUMBER_ANSWER', TIMEOUT, 'renumbered current lane tree marker');
+    assert.match(currentLine.line, /\b1,2\b|\b2\b/, currentLine.screen);
+
+    await main.close();
+    main = undefined;
+
+    await waitForVisibleText(branch, /~\/1\b/, TIMEOUT, 'branch footer rerenders back to ~/1 when the main lane detaches');
+    await waitUntil(async () => {
+      const screen = await visibleText(branch);
+      const line = lineContaining(screen, 'assistant: SYNC_FOOTER_RENUMBER_ANSWER');
+      return /\b1\b/.test(line) && !/\b2\b/.test(line) && !/\b1,2\b/.test(line);
+    }, TIMEOUT, 'open tree marker and footer compact together after peer detaches');
+  } finally {
+    await branch.close();
+    if (main) await main.close();
+    await removeRoot(root);
+  }
+});
+
+test('pi-sync ignores stale lane files when opening an old session', { timeout: 90_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-sync-stale-old-session-'));
+  const laneRoot = join(root, 'lane');
+  const sessionFile = join(root, 'shared.jsonl');
+  const piWrapper = join(root, 'pi-wrapper.sh');
+  writeFileSync(sessionFile, [
+    JSON.stringify({ type: 'session', version: 3, id: 'stale-old-session', timestamp: new Date().toISOString(), cwd: root }),
+    JSON.stringify({ type: 'message', id: 'old-user', parentId: null, timestamp: new Date().toISOString(), message: { role: 'user', content: [{ type: 'text', text: 'SYNC_OLD_SESSION_PROMPT' }] } }),
+    JSON.stringify({ type: 'message', id: 'old-assistant', parentId: 'old-user', timestamp: new Date().toISOString(), message: { role: 'assistant', content: [{ type: 'text', text: 'SYNC_OLD_SESSION_ANSWER' }], stopReason: 'stop', usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }),
+    '',
+  ].join('\n'), 'utf8');
+  const canonicalSessionFile = realpathSync(sessionFile);
+  const sessionKey = stableSessionKey(canonicalSessionFile);
+  writeLaneFixture(laneRoot, sessionKey, canonicalSessionFile, { name: 'main', displayId: 'L1', headEntryId: 'old-assistant' });
+  writeLaneFixture(laneRoot, sessionKey, canonicalSessionFile, { name: 'lane-2', displayId: 'L2', headEntryId: 'old-user' });
+  writeLaneFixture(laneRoot, sessionKey, canonicalSessionFile, { name: 'tree-stale', displayId: 'L3', headEntryId: 'old-assistant' });
+  writeInstanceFixture(laneRoot, sessionKey, canonicalSessionFile, {
+    instanceId: 'stale-side',
+    lane: 'lane-2',
+    leafId: 'old-user',
+    lastSeenAt: '2000-01-01T00:00:00.000Z',
+  });
+  writeInstanceFixture(laneRoot, sessionKey, canonicalSessionFile, {
+    instanceId: 'stale-tree',
+    lane: 'tree-stale',
+    leafId: 'old-assistant',
+    lastSeenAt: '2000-01-01T00:00:00.000Z',
+  });
+  writeFileSync(piWrapper, `#!/usr/bin/env bash\nargs=()\nfor a in "$@"; do [[ "$a" == "--no-session" ]] && continue; args+=("$a"); done\nexec "${process.env.PI_SYNC_TEST_PI_BINARY ?? 'pi'}" "\${args[@]}"\n`);
+  chmodSync(piWrapper, 0o755);
+
+  const mock = await createInteractiveMock({
+    brain: script(text('UNUSED_OLD_SESSION_RESPONSE')),
+    extensions: [EXTENSION, STATUS_EXTENSION],
+    piProvider: 'pi-mock',
+    piModel: 'mock',
+    startupTimeoutMs: 20_000,
+    terminal: { cols: 140, rows: 34 },
+    cwd: root,
+    env: {
+      PI_LANE_ROOT: laneRoot,
+      PI_SYNC_POLL_MS: '25',
+      PI_SYNC_HOST_IDLE_MS: '1000',
+      PI_SYNC_INSTANCE_STALE_MS: '500',
+    },
+    piBinary: piWrapper,
+    piArgs: ['--session', sessionFile],
+  });
+
+  try {
+    await mock.waitForOutput('SYNC_OLD_SESSION_ANSWER', TIMEOUT);
+    await waitForVisibleText(mock, /~\/1\b/, TIMEOUT, 'old session footer ignores stale lane files');
+    mock.clearOutput();
+    mock.submit('/tree');
+    const assistantLine = await waitForVisibleLine(mock, 'assistant: SYNC_OLD_SESSION_ANSWER', TIMEOUT, 'old session current tree marker');
+    assert.match(assistantLine.line, /\b1\b/, assistantLine.screen);
+    assert.doesNotMatch(assistantLine.line, /\b2\b|\b3\b/, assistantLine.screen);
+    assert.doesNotMatch(lineContaining(assistantLine.screen, 'user: SYNC_OLD_SESSION_PROMPT'), /\b2\b|\b3\b/);
+  } finally {
+    await mock.close();
+    await removeRoot(root);
+  }
+});
+
+test('pi-sync removes markers for a killed terminal after its instance ages out', { timeout: 90_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-sync-killed-marker-'));
+  const laneRoot = join(root, 'lane');
+  const sessionFile = join(root, 'shared.jsonl');
+  const piWrapper = join(root, 'pi-wrapper.sh');
+  writeFileSync(sessionFile, [
+    JSON.stringify({ type: 'session', version: 3, id: 'killed-marker-session', timestamp: new Date().toISOString(), cwd: root }),
+    JSON.stringify({ type: 'message', id: 'killed-user', parentId: null, timestamp: new Date().toISOString(), message: { role: 'user', content: [{ type: 'text', text: 'SYNC_KILLED_MARKER_PROMPT' }] } }),
+    JSON.stringify({ type: 'message', id: 'killed-assistant', parentId: 'killed-user', timestamp: new Date().toISOString(), message: { role: 'assistant', content: [{ type: 'text', text: 'SYNC_KILLED_MARKER_ANSWER' }], stopReason: 'stop', usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }),
+    '',
+  ].join('\n'), 'utf8');
+  writeFileSync(piWrapper, `#!/usr/bin/env bash\nargs=()\nfor a in "$@"; do [[ "$a" == "--no-session" ]] && continue; args+=("$a"); done\nexec "${process.env.PI_SYNC_TEST_PI_BINARY ?? 'pi'}" "\${args[@]}"\n`);
+  chmodSync(piWrapper, 0o755);
+
+  const common = {
+    brain: script(text('UNUSED_KILLED_MARKER_RESPONSE')),
+    extensions: [EXTENSION],
+    piProvider: 'pi-mock',
+    piModel: 'mock',
+    startupTimeoutMs: 20_000,
+    terminal: { cols: 120, rows: 34 },
+    cwd: root,
+    env: {
+      PI_LANE_ROOT: laneRoot,
+      PI_SYNC_POLL_MS: '25',
+      PI_SYNC_HOST_IDLE_MS: '1000',
+      PI_LANE_HEARTBEAT_MS: '100',
+      PI_SYNC_INSTANCE_STALE_MS: '500',
+    },
+    piBinary: piWrapper,
+    piArgs: ['--session', sessionFile],
+  };
+
+  const watcher = await createInteractiveMock(common);
+  const doomed = await createInteractiveMock(common);
+  try {
+    await watcher.waitForOutput('SYNC_KILLED_MARKER_ANSWER', TIMEOUT);
+    await doomed.waitForOutput('SYNC_KILLED_MARKER_ANSWER', TIMEOUT);
+
+    watcher.clearOutput();
+    watcher.submit('/tree');
+    await waitForVisibleLine(watcher, 'assistant: SYNC_KILLED_MARKER_ANSWER', TIMEOUT, 'initial killed-marker tree row');
+
+    doomed.clearOutput();
+    doomed.submit('/lane new');
+    await doomed.waitForOutput(/created ln_[A-Za-z0-9_-]+ -> now ~\/2 ln_[A-Za-z0-9_-]+/, TIMEOUT);
+    await waitUntil(async () => {
+      const screen = await visibleText(watcher);
+      return /\b1,2\b/.test(lineContaining(screen, 'assistant: SYNC_KILLED_MARKER_ANSWER'));
+    }, TIMEOUT, 'tree marker includes killed candidate before SIGKILL');
+
+    const stats = doomed.getProcessStats();
+    assert.ok(stats?.pid, 'expected doomed pi process pid');
+    process.kill(stats.pid, 'SIGKILL');
+
+    await waitUntil(async () => {
+      const screen = await visibleText(watcher);
+      const line = lineContaining(screen, 'assistant: SYNC_KILLED_MARKER_ANSWER');
+      return /\b1\b/.test(line) && !/\b2\b/.test(line) && !/\b1,2\b/.test(line);
+    }, TIMEOUT, 'killed terminal marker disappears after stale timeout');
+  } finally {
+    await watcher.close();
+    await doomed.close();
     await removeRoot(root);
   }
 });

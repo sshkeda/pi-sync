@@ -132,14 +132,14 @@ export default function treeNavHelper(pi) {
     b.submit('/_tree_nav_to_text SYNC_OWNER_FIRST_ANSWER');
     await b.waitForOutput('leaf_after_nav:', TIMEOUT);
 
-    b.submit('/lane new audit-side');
-    await b.waitForOutput(/created and joined 2 \(audit-side\)/, TIMEOUT);
+    b.submit('/lane new');
+    await b.waitForOutput(/created ln_[A-Za-z0-9_-]+ -> now ~\/2 ln_[A-Za-z0-9_-]+/, TIMEOUT);
 
     b.submit('/lane join 1');
-    await b.waitForOutput(/joined 1 \(main\)/, TIMEOUT);
+    await b.waitForOutput(/joined ln_[A-Za-z0-9_-]+ -> now ~\/1 ln_[A-Za-z0-9_-]+/, TIMEOUT);
 
     b.submit('/lane status');
-    await b.waitForOutput(/pi-sync lane: current 1 \(main\)/, TIMEOUT);
+    await b.waitForOutput(/pi-sync lane: current ~\/1 ln_[A-Za-z0-9_-]+/, TIMEOUT);
 
     b.submit('/sync status');
     await b.waitForOutput(/pi-sync: instance=/, TIMEOUT);

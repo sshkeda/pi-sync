@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdtempSync, readFileSync, realpathSync, writeFileSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInteractiveMock, createControllableBrain, streamText, text } from '../../pi-mock/dist/index.js';
@@ -77,6 +77,70 @@ function ensurePersistedUserPrompt(sessionFile, cwd, prompt) {
   writeFileSync(sessionFile, `${entries.map((entry) => JSON.stringify(entry)).join('\n')}\n`, 'utf8');
 }
 
+function writeCompletedBaseSession(sessionFile, cwd, prompt, answer) {
+  const now = new Date().toISOString();
+  writeFileSync(sessionFile, [
+    JSON.stringify({ type: 'session', version: 3, id: 'active-guard-session', timestamp: now, cwd }),
+    JSON.stringify({ type: 'message', id: 'active-guard-base-user', parentId: null, timestamp: now, message: { role: 'user', content: [{ type: 'text', text: prompt }] } }),
+    JSON.stringify({ type: 'message', id: 'active-guard-base-assistant', parentId: 'active-guard-base-user', timestamp: now, message: { role: 'assistant', content: [{ type: 'text', text: answer }], stopReason: 'stop', usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }),
+    '',
+  ].join('\n'), 'utf8');
+}
+
+function appendPersistedUserPrompt(sessionFile, prompt, parentId) {
+  const now = new Date().toISOString();
+  const entry = { type: 'message', id: 'active-guard-user-prompt', parentId, timestamp: now, message: { role: 'user', content: [{ type: 'text', text: prompt }], timestamp: Date.now() } };
+  writeFileSync(sessionFile, `${readFileSync(sessionFile, 'utf8').trimEnd()}\n${JSON.stringify(entry)}\n`, 'utf8');
+}
+
+function writeMainLaneState(laneRoot, sessionKey, sessionFile, headEntryId) {
+  const now = new Date().toISOString();
+  const dir = join(laneRoot, 'sessions', sessionKey, 'lanes');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'main.json'), JSON.stringify({
+    schemaVersion: 1,
+    name: 'main',
+    sessionKey,
+    baseLeafId: null,
+    headEntryId,
+    headEpoch: 1,
+    createdAt: now,
+    updatedAt: now,
+    id: 'ln_activeguard',
+    displayId: 'L1',
+    aliasPath: join(laneRoot, 'flat', 'ln_activeguard.json'),
+  }, null, 2));
+}
+
+function readMainLaneState(laneRoot, sessionKey) {
+  return JSON.parse(readFileSync(join(laneRoot, 'sessions', sessionKey, 'lanes', 'main.json'), 'utf8'));
+}
+
+function messageText(entry) {
+  const content = entry?.message?.content;
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .filter((part) => part?.type === 'text' && typeof part.text === 'string')
+    .map((part) => part.text)
+    .join('');
+}
+
+function findMessageEntry(sessionFile, textValue) {
+  return readFileSync(sessionFile, 'utf8')
+    .trim()
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+    .find((entry) => messageText(entry) === textValue);
+}
+
+function readHostInfo(laneRoot, sessionKey) {
+  const path = join(laneRoot, 'sessions', sessionKey, 'lanes', 'main', 'sync', 'host.json');
+  if (!existsSync(path)) return undefined;
+  return JSON.parse(readFileSync(path, 'utf8'));
+}
+
 test('pi-sync hydrates a late-joining attached terminal during an active turn', { timeout: 90_000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-sync-late-join-'));
   const laneRoot = join(root, 'lane');
@@ -130,6 +194,69 @@ test('pi-sync hydrates a late-joining attached terminal during an active turn', 
       `late join must not duplicate persisted user prompts after the active response:\n${afterResponse.join('\n')}`,
     );
     assert.match(b.output, /SYNC_LATE_JOIN_RESPONSE/);
+  } finally {
+    await a.close();
+    if (b) await b.close();
+    await removeRoot(root);
+  }
+});
+
+test('pi-sync late join does not reconcile an active host lane to a persisted user prompt', { timeout: 90_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-sync-late-join-active-head-guard-'));
+  const laneRoot = join(root, 'lane');
+  const sessionFile = join(root, 'shared.jsonl');
+  const piWrapper = writePiWrapper(root);
+  const brain = createControllableBrain();
+  const sessionKey = 'late-join-active-head-guard-key';
+  writeCompletedBaseSession(sessionFile, root, 'SYNC_ACTIVE_GUARD_BASE_PROMPT', 'SYNC_ACTIVE_GUARD_BASE_ANSWER');
+  const canonicalSessionFile = realpathSync(sessionFile);
+  writeMainLaneState(laneRoot, sessionKey, canonicalSessionFile, 'active-guard-base-assistant');
+
+  const common = {
+    brain: brain.brain,
+    extensions: [EXTENSION],
+    piProvider: 'pi-mock',
+    piModel: 'mock',
+    startupTimeoutMs: 20_000,
+    terminal: { cols: 110, rows: 34 },
+    cwd: root,
+    env: { PI_LANE_ROOT: laneRoot, PI_LANE_SESSION_KEY: sessionKey, PI_LANE_SESSION_FILE: canonicalSessionFile, PI_SYNC_POLL_MS: '25', PI_SYNC_HOST_IDLE_MS: '1000' },
+    piBinary: piWrapper,
+    piArgs: ['--session', sessionFile],
+  };
+
+  const a = await createInteractiveMock(common);
+  let b;
+  try {
+    await a.waitForOutput('SYNC_ACTIVE_GUARD_BASE_ANSWER', TIMEOUT);
+    const baseHeadBeforePrompt = readMainLaneState(laneRoot, sessionKey).headEntryId;
+    a.clearOutput();
+    a.submit('SYNC_ACTIVE_GUARD_PROMPT');
+    const call = await brain.waitForCall(TIMEOUT);
+    await waitUntil(() => !!readHostInfo(laneRoot, sessionKey)?.activePromptId, TIMEOUT, 'active host prompt before late join');
+    appendPersistedUserPrompt(sessionFile, 'SYNC_ACTIVE_GUARD_PROMPT', 'active-guard-base-assistant');
+
+    b = await createInteractiveMock(common);
+    await b.waitForOutput('SYNC_ACTIVE_GUARD_PROMPT', TIMEOUT);
+    const activePrompt = findMessageEntry(sessionFile, 'SYNC_ACTIVE_GUARD_PROMPT');
+    assert.equal(
+      readMainLaneState(laneRoot, sessionKey).headEntryId,
+      baseHeadBeforePrompt,
+      'late join startup must leave an active host lane head on the previous assistant',
+    );
+    assert.notEqual(readMainLaneState(laneRoot, sessionKey).headEntryId, activePrompt.id, 'active host lane head must not move to the persisted user prompt');
+
+    call.respond(text('SYNC_ACTIVE_GUARD_RESPONSE'));
+    await a.waitForOutput('SYNC_ACTIVE_GUARD_RESPONSE', TIMEOUT);
+    await b.waitForOutput('SYNC_ACTIVE_GUARD_RESPONSE', TIMEOUT);
+    await waitUntil(
+      () => {
+        const response = findMessageEntry(sessionFile, 'SYNC_ACTIVE_GUARD_RESPONSE');
+        return response && readMainLaneState(laneRoot, sessionKey).headEntryId === response.id;
+      },
+      TIMEOUT,
+      'lane head advances after active host response',
+    );
   } finally {
     await a.close();
     if (b) await b.close();

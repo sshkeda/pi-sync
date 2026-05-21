@@ -42,6 +42,8 @@ test('pi-sync lane commands use live numeric lane ids and complete lane argument
   const previousStale = process.env.PI_SYNC_INSTANCE_STALE_MS;
   const previousSyncKey = process.env.PI_SYNC_SESSION_KEY;
   const previousLaneKey = process.env.PI_LANE_SESSION_KEY;
+  const mainLaneId = 'ln_a1b2c3d4';
+  const sideLaneId = 'ln_e5f6g7h8';
   process.env.PI_SYNC_ROOT = laneRoot;
   process.env.PI_LANE_ROOT = laneRoot;
   process.env.PI_SYNC_INSTANCE_STALE_MS = '5000';
@@ -59,9 +61,9 @@ test('pi-sync lane commands use live numeric lane ids and complete lane argument
     headEpoch: 0,
     createdAt: now,
     updatedAt: now,
-    id: `${sessionKey.slice(0, 8)}-L1`,
+    id: mainLaneId,
     displayId: 'L1',
-    aliasPath: join(laneRoot, 'flat', `${sessionKey.slice(0, 8)}-L1.json`),
+    aliasPath: join(laneRoot, 'flat', `${mainLaneId}.json`),
   }, null, 2));
   writeFileSync(join(laneRoot, 'sessions', sessionKey, 'lanes', 'lane-2.json'), JSON.stringify({
     schemaVersion: 1,
@@ -72,9 +74,9 @@ test('pi-sync lane commands use live numeric lane ids and complete lane argument
     headEpoch: 0,
     createdAt: now,
     updatedAt: now,
-    id: `${sessionKey.slice(0, 8)}-L2`,
+    id: sideLaneId,
     displayId: 'L2',
-    aliasPath: join(laneRoot, 'flat', `${sessionKey.slice(0, 8)}-L2.json`),
+    aliasPath: join(laneRoot, 'flat', `${sideLaneId}.json`),
   }, null, 2));
   writeFileSync(join(laneRoot, 'sessions', sessionKey, 'instances', 'main.json'), JSON.stringify({
     instanceId: 'main',
@@ -109,9 +111,9 @@ test('pi-sync lane commands use live numeric lane ids and complete lane argument
     assert.deepEqual(completions.map((item) => item.value), ['join ']);
 
     completions = await mock.getCompletions('lane', 'join ');
-    assert.ok(completions.some((item) => item.label === '1' && item.value === 'join 1' && item.description === 'main'), JSON.stringify(completions));
-    assert.ok(completions.some((item) => item.label === '2' && item.value === 'join 2' && item.description === 'lane-2'), JSON.stringify(completions));
-    assert.doesNotMatch(JSON.stringify(completions), /~\/2|L2/);
+    assert.ok(completions.some((item) => item.label === '1' && item.value === 'join 1' && item.description === mainLaneId), JSON.stringify(completions));
+    assert.ok(completions.some((item) => item.label === '2' && item.value === 'join 2' && item.description === sideLaneId), JSON.stringify(completions));
+    assert.doesNotMatch(JSON.stringify(completions), /~\/2|L2|main|lane-2/);
   } finally {
     if (previousSyncRoot === undefined) delete process.env.PI_SYNC_ROOT;
     else process.env.PI_SYNC_ROOT = previousSyncRoot;
@@ -155,31 +157,39 @@ test('pi-sync lane status counts live terminals per lane and numeric join resolv
     b.clearOutput();
 
     a.submit('/lane new');
-    await a.waitForOutput(/created and joined 2 \(lane-2\)/, TIMEOUT);
+    await a.waitForOutput(/created ln_[A-Za-z0-9_-]+ -> now ~\/2 ln_[A-Za-z0-9_-]+/, TIMEOUT);
 
     a.clearOutput();
     a.submit('/lane join 1');
-    await a.waitForOutput(/joined 1 \(main\)/, TIMEOUT);
+    await a.waitForOutput(/joined ln_[A-Za-z0-9_-]+ -> now ~\/1 ln_[A-Za-z0-9_-]+/, TIMEOUT);
 
     a.clearOutput();
     a.submit('/lane new side');
-    await a.waitForOutput(/created and joined 2 \(side\)/, TIMEOUT);
+    await a.waitForOutput(/does not take a name/, TIMEOUT);
+
+    a.clearOutput();
+    a.submit('/lane join main');
+    await a.waitForOutput(/no lane main/, TIMEOUT);
+
+    a.clearOutput();
+    a.submit('/lane new');
+    await a.waitForOutput(/created ln_[A-Za-z0-9_-]+ -> now ~\/2 ln_[A-Za-z0-9_-]+/, TIMEOUT);
 
     a.clearOutput();
     a.submit('/lane status');
-    await a.waitForOutput(/current 2 \(side\)[\s\S]*connected 1/, TIMEOUT);
+    await a.waitForOutput(/current ~\/2 ln_[A-Za-z0-9_-]+[\s\S]*connected 1/, TIMEOUT);
 
     b.clearOutput();
     b.submit('/lane status');
-    await b.waitForOutput(/current 1 \(main\)[\s\S]*connected 1/, TIMEOUT);
+    await b.waitForOutput(/current ~\/1 ln_[A-Za-z0-9_-]+[\s\S]*connected 1/, TIMEOUT);
 
     b.clearOutput();
     b.submit('/lane join 2');
-    await b.waitForOutput(/joined 1 \(side\)/, TIMEOUT);
+    await b.waitForOutput(/joined ln_[A-Za-z0-9_-]+ -> now ~\/1 ln_[A-Za-z0-9_-]+/, TIMEOUT);
 
     b.clearOutput();
     b.submit('/lane status');
-    await b.waitForOutput(/current 1 \(side\)[\s\S]*connected 2/, TIMEOUT);
+    await b.waitForOutput(/current ~\/1 ln_[A-Za-z0-9_-]+[\s\S]*connected 2/, TIMEOUT);
 
     const screen = (await b.visibleScreen()).join('\n');
     assert.doesNotMatch(screen, /no lane 2/, screen);
@@ -225,28 +235,35 @@ test('pi-sync compacts visible lane labels after a peer lane disconnects', { tim
     b.clearOutput();
     c.clearOutput();
 
-    b.submit('/lane new alpha');
-    await b.waitForOutput(/created and joined 2 \(alpha\)/, TIMEOUT);
+    b.submit('/lane new');
+    await b.waitForOutput(/created ln_[A-Za-z0-9_-]+ -> now ~\/2 ln_[A-Za-z0-9_-]+/, TIMEOUT);
 
-    c.submit('/lane new zeta');
-    await c.waitForOutput(/created and joined 3 \(zeta\)/, TIMEOUT);
+    c.submit('/lane new');
+    await c.waitForOutput(/created ln_[A-Za-z0-9_-]+ -> now ~\/3 ln_[A-Za-z0-9_-]+/, TIMEOUT);
 
     c.clearOutput();
     c.submit('/lane status');
-    await c.waitForOutput(/current 3 \(zeta\)[\s\S]*connected 1/, TIMEOUT);
+    await c.waitForOutput(/current ~\/3 ln_[A-Za-z0-9_-]+[\s\S]*connected 1/, TIMEOUT);
 
     await b.close();
     await sleep(800);
 
     c.clearOutput();
     c.submit('/lane status');
-    await c.waitForOutput(/current 2 \(zeta\)/, TIMEOUT);
+    await c.waitForOutput(/current ~\/2 ln_[A-Za-z0-9_-]+/, TIMEOUT);
     const compactedScreen = (await c.visibleScreen()).join('\n');
-    assert.match(compactedScreen, /current\s+2[\s\S]*zeta/, compactedScreen);
+    assert.match(compactedScreen, /current\s+~\/2\s+ln_[A-Za-z0-9_-]+/, compactedScreen);
 
     a.clearOutput();
     a.submit('/lane status');
-    await a.waitForOutput(/current 1 \(main\)/, TIMEOUT);
+    await a.waitForOutput(/current ~\/1 ln_[A-Za-z0-9_-]+/, TIMEOUT);
+
+    a.clearOutput();
+    a.submit('/lane join 2');
+    await a.waitForOutput(/joined ln_[A-Za-z0-9_-]+ -> now ~\/1 ln_[A-Za-z0-9_-]+/, TIMEOUT);
+    a.clearOutput();
+    a.submit('/lane status');
+    await a.waitForOutput(/current ~\/1 ln_[A-Za-z0-9_-]+[\s\S]*connected 2/, TIMEOUT);
   } finally {
     await a.close();
     await b.close();

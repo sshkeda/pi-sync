@@ -16,6 +16,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit --skipLibCheck --allowImportingTsExtensions --moduleResolution bundler --module esnext --target es2022 --types node index.ts src/runtime.ts src/lane-state.ts",
     "test": "bash scripts/run-tests.sh",
+    "test:quick": "bash scripts/run-tests.sh --quick",
     "bench:latency": "node scripts/benchmark-latency.mjs",
     "record:side-by-side": "node scripts/record-side-by-side.mjs"
   },

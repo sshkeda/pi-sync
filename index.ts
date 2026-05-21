@@ -32,6 +32,7 @@ import {
   laneSessionDir,
   laneStatePath,
   nowIso,
+  newLaneId,
   readLane,
   readJsonFile,
   sanitizeLaneName,
@@ -726,6 +727,7 @@ export default function piSync(pi: ExtensionAPI) {
 
   function writeLaneInstance(ctx: ExtensionContext, file: string, status = currentStatus): void {
     currentStatus = status;
+    const previousDisplayId = process.env.PI_LANE_CURRENT_LANE_ID ?? process.env.PI_SYNC_CHANNEL_ID;
     const lane = exportLaneIdentity(ctx, file);
     if (!lane || !currentSessionKey) return;
     const state: InstanceState = {
@@ -741,7 +743,8 @@ export default function piSync(pi: ExtensionAPI) {
       lastSeenAt: nowIso(),
     };
     writeJsonFile(instancePath(currentSessionKey, instanceId), state);
-    if (updateTreeMarkers(currentSessionKey, file)) (ctx.ui as any)?.requestRender?.();
+    const displayIdChanged = previousDisplayId !== (process.env.PI_LANE_CURRENT_LANE_ID ?? process.env.PI_SYNC_CHANNEL_ID);
+    if (displayIdChanged || updateTreeMarkers(currentSessionKey, file)) (ctx.ui as any)?.requestRender?.();
   }
 
   function readLaneInstances(sessionKey: string): InstanceState[] {
@@ -798,9 +801,13 @@ export default function piSync(pi: ExtensionAPI) {
     }
     if (includeLane) names.add(sanitizeLaneName(includeLane));
     if (names.size === 0) names.add(DEFAULT_LANE);
+    const states = new Map(readLaneStates(sessionKey).map((lane) => [sanitizeLaneName(lane.name), lane]));
     return [...names].sort((a, b) => {
       if (a === DEFAULT_LANE) return -1;
       if (b === DEFAULT_LANE) return 1;
+      const left = Date.parse(states.get(a)?.createdAt ?? "");
+      const right = Date.parse(states.get(b)?.createdAt ?? "");
+      if (Number.isFinite(left) && Number.isFinite(right) && left !== right) return left - right;
       return a.localeCompare(b);
     });
   }
@@ -820,12 +827,14 @@ export default function piSync(pi: ExtensionAPI) {
     const normalized = normalizeLaneSelector(selector);
     const sanitized = sanitizeLaneName(normalized);
     const lanes = readLaneStates(sessionKey);
-    const byName = lanes.find((lane) => sanitizeLaneName(lane.name) === sanitized);
+    const byCanonicalId = lanes.find((lane) => lane.id === normalized);
+    if (byCanonicalId) return byCanonicalId.name;
+    const byName = lanes.find((lane) => /^ln_[A-Za-z0-9_-]+$/.test(lane.name) && sanitizeLaneName(lane.name) === sanitized);
     if (byName) return byName.name;
     const upper = normalized.toUpperCase();
     const byDisplay = lanes.find((lane) => (lane.displayId ?? "").toUpperCase() === upper);
     if (byDisplay) return byDisplay.name;
-    if (upper === "L1" || sanitized === DEFAULT_LANE) return DEFAULT_LANE;
+    if (upper === "L1") return DEFAULT_LANE;
     return undefined;
   }
 
@@ -837,11 +846,11 @@ export default function piSync(pi: ExtensionAPI) {
 
   function nextDefaultLaneName(sessionKey: string): string {
     const used = new Set(readLaneStates(sessionKey).map((lane) => sanitizeLaneName(lane.name)));
-    for (let index = 2; index < 10_000; index++) {
-      const name = `lane-${index}`;
+    for (let index = 0; index < 10_000; index++) {
+      const name = newLaneId();
       if (!used.has(name)) return name;
     }
-    return `lane-${Date.now().toString(36)}`;
+    return `ln_${Date.now().toString(36)}`;
   }
 
   function laneIdFromDisplayId(displayId: string): string {
@@ -853,14 +862,21 @@ export default function piSync(pi: ExtensionAPI) {
     return laneIdFromDisplayId(activeLaneDisplayId(sessionKey, lane));
   }
 
+  function liveLaneLabel(sessionKey: string, lane: string): string {
+    return `~/${liveLaneId(sessionKey, lane)}`;
+  }
+
+  function laneCanonicalId(lane: LaneState): string {
+    return lane.id ?? lane.name;
+  }
+
   function displayLane(sessionKey: string, lane: LaneState): string {
-    const id = liveLaneId(sessionKey, lane.name);
-    return id === lane.name ? id : `${id} (${lane.name})`;
+    return `${liveLaneLabel(sessionKey, lane.name)} ${laneCanonicalId(lane)}`;
   }
 
   const laneSubcommands: AutocompleteItem[] = [
     { value: "status", label: "status", description: "Show current lane state" },
-    { value: "new ", label: "new", description: "Create and join a lane" },
+    { value: "new", label: "new", description: "Create and join a lane" },
     { value: "join ", label: "join", description: "Join an existing lane" },
     { value: "list", label: "list", description: "List lanes and live instances" },
     { value: "instances", label: "instances", description: "List live terminal instances" },
@@ -895,7 +911,7 @@ export default function piSync(pi: ExtensionAPI) {
         return {
           value: `join ${id}`,
           label: id,
-          description: lane.name,
+          description: laneCanonicalId(lane),
         };
       });
     return filterCompletions(items, selectorPrefix);
@@ -903,6 +919,22 @@ export default function piSync(pi: ExtensionAPI) {
 
   function notifyLane(ctx: ExtensionContext, message: string): void {
     ctx.ui?.notify?.(message, "info");
+  }
+
+  function reconcileLaneHeadToLoadedLeaf(ctx: ExtensionContext, sessionKey: string, file: string, laneName: string): LaneState {
+    const lane = ensureLane(sessionKey, file, laneName, persistedLeafId(file) ?? null);
+    const leaf = persistedLeafId(file) ?? sessionManager(ctx)?.getLeafId?.() ?? null;
+    if (typeof leaf === "string" && !persistedEntryExists(file, leaf)) return lane;
+    if ((lane.headEntryId ?? null) === leaf) return lane;
+    const owner = readTurnOwner(sessionKey, laneName);
+    const host = readHostInfo(sessionKey, laneName);
+    if (isOwnerFresh(owner) || (isHostFresh(host) && host.activePromptId)) return lane;
+    return updateLaneState(sessionKey, file, laneName, {
+      baseLeafId: lane.baseLeafId ?? leaf,
+      headEntryId: leaf,
+      headEpoch: lane.headEpoch + 1,
+      updatedBy: instanceId,
+    });
   }
 
   function initializeLaneSession(ctx: ExtensionContext): void {
@@ -917,16 +949,11 @@ export default function piSync(pi: ExtensionAPI) {
     const key = activeSessionKeyFor(ctx, file, activeSessionFile, activeSessionKey);
     mkdirSync(laneLanesDir(key), { recursive: true });
     mkdirSync(laneInstancesDir(key), { recursive: true });
-    ensureLane(key, file, DEFAULT_LANE, persistedLeafId(file) ?? null);
+    reconcileLaneHeadToLoadedLeaf(ctx, key, file, DEFAULT_LANE);
     writeLaneInstance(ctx, file, "idle");
     if (laneHeartbeatTimer) clearInterval(laneHeartbeatTimer);
     laneHeartbeatTimer = setInterval(() => writeLaneInstance(ctx, file), Math.max(250, Number(process.env.PI_LANE_HEARTBEAT_MS ?? 2_000)));
     laneHeartbeatTimer.unref?.();
-  }
-
-  function treeLaneNameForHead(headEntryId: string | null): string {
-    if (!headEntryId) return "tree-root";
-    return `tree-${createHash("sha256").update(headEntryId).digest("hex").slice(0, 12)}`;
   }
 
   function existingTreeLaneForHead(sessionKey: string, headEntryId: string | null): string | undefined {
@@ -947,26 +974,51 @@ export default function piSync(pi: ExtensionAPI) {
   function laneNameForTreeSelection(sessionKey: string, file: string, headEntryId: string | null): string {
     const main = ensureLane(sessionKey, file, DEFAULT_LANE, persistedLeafId(file) ?? null);
     if ((main.headEntryId ?? null) === headEntryId) return DEFAULT_LANE;
-    return existingTreeLaneForHead(sessionKey, headEntryId) ?? treeLaneNameForHead(headEntryId);
+    return existingTreeLaneForHead(sessionKey, headEntryId) ?? nextDefaultLaneName(sessionKey);
+  }
+
+  function durableTreeHeadEntryId(ctx: ExtensionContext, file: string, headEntryId: string | null): string | null {
+    if (headEntryId === null) return null;
+    if (persistedEntryExists(file, headEntryId)) return headEntryId;
+    const loadedLeaf = sessionManager(ctx)?.getLeafId?.() ?? null;
+    const persistedLeaf = persistedLeafId(file);
+    if (headEntryId === loadedLeaf && persistedLeaf !== undefined) return persistedLeaf;
+    if (persistedLeaf !== undefined) return persistedLeaf;
+    return headEntryId;
   }
 
   function switchLaneForTreeSelection(ctx: ExtensionContext, file: string, newHeadEntryId: string | null, oldLeafId?: string | null): void {
     const key = activeSessionKeyFor(ctx, file, activeSessionFile, activeSessionKey);
-    const lane = laneNameForTreeSelection(key, file, newHeadEntryId);
+    const durableHeadEntryId = durableTreeHeadEntryId(ctx, file, newHeadEntryId);
+    const lane = laneNameForTreeSelection(key, file, durableHeadEntryId);
     moduleCurrentLane = lane;
-    const current = ensureLane(key, file, lane, newHeadEntryId);
-    if ((current.headEntryId ?? null) !== newHeadEntryId || (current.baseLeafId ?? null) !== newHeadEntryId) {
+    const current = ensureLane(key, file, lane, durableHeadEntryId);
+    const owner = readTurnOwner(key, lane);
+    const host = readHostInfo(key, lane);
+    if ((isOwnerFresh(owner) || (isHostFresh(host) && host.activePromptId)) && (current.headEntryId ?? null) !== durableHeadEntryId) {
+      appendDebug(key, "tree_navigation_lane_switch_skipped_active_host", {
+        lane,
+        oldLeafId: oldLeafId ?? null,
+        newHeadEntryId: durableHeadEntryId,
+        currentHeadEntryId: current.headEntryId ?? null,
+        instanceId,
+      });
+      writeLaneInstance(ctx, file, "idle");
+      updateTreeMarkers(key, file);
+      return;
+    }
+    if ((current.headEntryId ?? null) !== durableHeadEntryId || (current.baseLeafId ?? null) !== durableHeadEntryId) {
       updateLaneState(key, file, lane, {
-        baseLeafId: current.baseLeafId ?? newHeadEntryId,
-        headEntryId: newHeadEntryId,
-        headEpoch: (current.headEntryId ?? null) === newHeadEntryId ? current.headEpoch : current.headEpoch + 1,
+        baseLeafId: current.baseLeafId ?? durableHeadEntryId,
+        headEntryId: durableHeadEntryId,
+        headEpoch: (current.headEntryId ?? null) === durableHeadEntryId ? current.headEpoch : current.headEpoch + 1,
         updatedBy: instanceId,
       });
     }
     appendDebug(key, "tree_navigation_lane_switch", {
       lane,
       oldLeafId: oldLeafId ?? null,
-      newHeadEntryId,
+      newHeadEntryId: durableHeadEntryId,
       instanceId,
     });
     writeLaneInstance(ctx, file, "idle");
@@ -1825,22 +1877,30 @@ export default function piSync(pi: ExtensionAPI) {
       const command = rawCommand || "status";
 
       if (command === "new") {
-        const name = sanitizeLaneName(rawName || nextDefaultLaneName(key));
+        if (rawName) {
+          notifyLane(ctx, "pi-sync lane: /lane new does not take a name; use /lane new");
+          return;
+        }
+        const name = nextDefaultLaneName(key);
         const leaf = sessionManager(ctx)?.getLeafId?.() ?? null;
         moduleCurrentLane = name;
         const lane = ensureLane(key, file, name, leaf);
         writeLaneInstance(ctx, file, "idle");
         refreshAfterCommand(ctx);
-        notifyLane(ctx, `pi-sync lane: created and joined ${displayLane(key, lane)}`);
+        notifyLane(ctx, `pi-sync lane: created ${laneCanonicalId(lane)} -> now ${displayLane(key, lane)}`);
         return;
       }
 
       if (command === "join") {
-        const resolvedName = resolveLaneName(key, rawName || DEFAULT_LANE);
-        const name = resolvedName ? sanitizeLaneName(resolvedName) : sanitizeLaneName(rawName || DEFAULT_LANE);
+        if (!rawName) {
+          notifyLane(ctx, "pi-sync lane: usage /lane join <~/N|N|ln_id>");
+          return;
+        }
+        const resolvedName = resolveLaneName(key, rawName);
+        const name = resolvedName ? sanitizeLaneName(resolvedName) : sanitizeLaneName(rawName);
         const existingLane = resolvedName ? readLane(key, name) : undefined;
         if (!existingLane) {
-          notifyLane(ctx, `pi-sync lane: no lane ${rawName || name}; use /lane list or /lane new ${name}`);
+          notifyLane(ctx, `pi-sync lane: no lane ${rawName}; use /lane list or /lane new`);
           return;
         }
         sessionManager(ctx)?.setSessionFile?.(file);
@@ -1849,36 +1909,39 @@ export default function piSync(pi: ExtensionAPI) {
         else sessionManager(ctx)?.resetLeaf?.();
         writeLaneInstance(ctx, file, "idle");
         refreshAfterCommand(ctx);
-        notifyLane(ctx, `pi-sync lane: joined ${displayLane(key, existingLane)}`);
+        notifyLane(ctx, `pi-sync lane: joined ${laneCanonicalId(existingLane)} -> now ${displayLane(key, existingLane)}`);
         return;
       }
 
       if (command === "list") {
         const names = readLaneStates(key)
           .sort((a, b) => liveLaneId(key, a.name).localeCompare(liveLaneId(key, b.name), undefined, { numeric: true }))
-          .map((item) => `${liveLaneId(key, item.name)}(${item.name})`);
+          .map((item) => `${liveLaneLabel(key, item.name)} ${laneCanonicalId(item)}`);
         const instances = liveLaneInstances(key)
           .map((item) => {
             const lane = readLane(key, item.lane);
-            return `${lane ? liveLaneId(key, lane.name) : item.lane}:${item.status}:${item.pid}`;
+            return `${lane ? liveLaneLabel(key, lane.name) : item.lane}:${item.status}:${item.pid}`;
           })
           .join(", ");
         const current = ensureLane(key, file, currentLane(), sessionManager(ctx)?.getLeafId?.() ?? null);
-        notifyLane(ctx, `pi-sync lane: lanes ${names.join(", ") || "1(main)"}; current ${liveLaneId(key, current.name)}; instances ${instances || "none"}`);
+        notifyLane(ctx, `pi-sync lane: lanes ${names.join(", ") || "<none>"}; current ${displayLane(key, current)}; instances ${instances || "none"}`);
         return;
       }
 
       if (command === "instances") {
         const instances = liveLaneInstances(key)
-          .map((item) => `${item.instanceId.slice(0, 8)} ${item.lane} ${item.status} pid=${item.pid} seen=${item.lastSeenAt}`)
+          .map((item) => {
+            const lane = readLane(key, item.lane);
+            return `${item.instanceId.slice(0, 8)} ${lane ? displayLane(key, lane) : item.lane} ${item.status} pid=${item.pid} seen=${item.lastSeenAt}`;
+          })
           .join("; ");
         notifyLane(ctx, `pi-sync lane: instances ${instances || "none"}`);
         return;
       }
 
       if (command === "identity" || command === "self") {
-        exportLaneIdentity(ctx, file);
-        notifyLane(ctx, `pi-sync lane: identity sessionId=${currentSessionId ?? "<none>"} sessionKey=${currentSessionKey} sessionFile=${currentSessionFile} instanceId=${instanceId} currentLane=${currentLane()} laneId=${process.env.PI_LANE_CURRENT_LANE_ID ?? "<none>"} laneFile=${process.env.PI_LANE_CURRENT_LANE_FILE ?? "<none>"} root=${laneRoot()} pid=${process.pid}`);
+        const lane = exportLaneIdentity(ctx, file);
+        notifyLane(ctx, `pi-sync lane: identity sessionId=${currentSessionId ?? "<none>"} sessionKey=${currentSessionKey} sessionFile=${currentSessionFile} instanceId=${instanceId} lane=${lane ? displayLane(key, lane) : "<none>"} laneFile=${process.env.PI_LANE_CURRENT_LANE_FILE ?? "<none>"} root=${laneRoot()} pid=${process.pid}`);
         return;
       }
 
@@ -1926,11 +1989,13 @@ export default function piSync(pi: ExtensionAPI) {
       }
       const owner = readTurnOwner(activeSessionKey, activeLane ?? currentLane());
       const freshOwner = isOwnerFresh(owner) ? owner : undefined;
-      const host = readHostInfo(activeSessionKey, activeLane ?? currentLane());
+      const laneName = activeLane ?? currentLane();
+      const lane = readLane(activeSessionKey, laneName);
+      const host = readHostInfo(activeSessionKey, laneName);
       const freshHost = isHostFresh(host) ? host : undefined;
       const hasNativeReplay = typeof (ctx.ui as any).replayAgentEvent === "function";
       ctx.ui.notify(
-        `pi-sync: instance=${instanceId} sessionId=${sessionId(ctx) ?? "<none>"} sessionKey=${activeSessionKey} sync=${activeLane ?? currentLane()} nativeReplay=${hasNativeReplay ? "yes" : "no"} localOwnsTurn=${localOwnsTurn ? "yes" : "no"} activeOwner=${freshOwner?.instanceId ?? "<none>"} host=${freshHost ? `${freshHost.pid}/${freshHost.instanceId.slice(0, 8)}` : "<none>"} readOffset=${readOffset} events=${activeEventPath}`,
+        `pi-sync: instance=${instanceId} sessionId=${sessionId(ctx) ?? "<none>"} sessionKey=${activeSessionKey} sync=${lane ? displayLane(activeSessionKey, lane) : laneName} nativeReplay=${hasNativeReplay ? "yes" : "no"} localOwnsTurn=${localOwnsTurn ? "yes" : "no"} activeOwner=${freshOwner?.instanceId ?? "<none>"} host=${freshHost ? `${freshHost.pid}/${freshHost.instanceId.slice(0, 8)}` : "<none>"} readOffset=${readOffset} events=${activeEventPath}`,
         "info",
       );
     },

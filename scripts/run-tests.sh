@@ -17,51 +17,58 @@ fi
 
 export PI_SYNC_TEST_PI_BINARY="${PI_SYNC_TEST_PI_BINARY:-pi}"
 
-if [[ "$#" -gt 0 ]]; then
-  for f in "$@"; do
-    echo "RUN:$f"
-    node --test "$f"
-  done
-  exit 0
+mode="full"
+files=()
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --quick)
+      mode="quick"
+      shift
+      ;;
+    --full)
+      mode="full"
+      shift
+      ;;
+    --no-typecheck)
+      PI_SYNC_TEST_SKIP_TYPECHECK=1
+      shift
+      ;;
+    *)
+      files+=("$1")
+      shift
+      ;;
+  esac
+done
+
+quick_files=(
+  test/noninteractive-does-not-intercept.test.mjs
+  test/pil-cli.test.mjs
+  test/headless-host-ui-filter.test.mjs
+  test/host-model-authority.test.mjs
+  test/host-idle-shutdown.test.mjs
+  test/lane-command.test.mjs
+  test/native-live-sync.test.mjs
+  test/abort-sync.test.mjs
+)
+
+if [[ "${#files[@]}" -eq 0 ]]; then
+  if [[ "$mode" == "quick" ]]; then
+    files=("${quick_files[@]}")
+  else
+    mapfile -t files < <(find test -maxdepth 1 -name '*.test.mjs' | sort)
+  fi
 fi
 
-for f in test/*.test.mjs; do
-  if [[ "$f" == "test/abort-sync.test.mjs" ]]; then
-    for pattern in \
-      "same tree sync lane" \
-      "attached terminal" \
-      "no host turn is active" \
-      "unsent cold-host prompt" \
-      "submitting terminal" \
-      "socket is reconnecting"; do
-      echo "RUN:$f -- $pattern"
-      node --test --test-name-pattern "$pattern" "$f"
-    done
-  elif [[ "$f" == "test/native-live-sync.test.mjs" ]]; then
-    for pattern in \
-      "publishes live updates" \
-      "active prompt once" \
-      "symlink and real session paths" \
-      "session id changes" \
-      "same-session peers" \
-      "stale inherited sync keys" \
-      "alias paths and different peer session ids" \
-      "separate sync lane" \
-      "forked tree path" \
-      "same-lane session trees" \
-      "disconnected lanes" \
-      "open session tree" \
-      "current single-lane" \
-      "root-position lane" \
-      "multiple live lanes" \
-      "display ids compact"
-    do
-      echo "RUN:$f -- $pattern"
-      node --test --test-name-pattern "$pattern" "$f"
-    done
-  else
-    echo "RUN:$f"
-    node --test "$f"
+if [[ "${PI_SYNC_TEST_SKIP_TYPECHECK:-0}" != "1" ]]; then
+  echo "RUN:typecheck"
+  npm run typecheck
+fi
+
+settle_ms="${PI_SYNC_TEST_SETTLE_MS:-0}"
+for f in "${files[@]}"; do
+  echo "RUN:$f"
+  node --test "$f"
+  if [[ "$settle_ms" != "0" ]]; then
+    sleep "$(node -e "console.log(Number(process.argv[1]) / 1000)" "$settle_ms")"
   fi
-  sleep 1
 done

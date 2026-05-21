@@ -28,6 +28,18 @@ function countVisible(lines, needle) {
   return lines.filter((line) => line.includes(needle)).length;
 }
 
+async function removeRoot(root) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      rmSync(root, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      if (attempt === 4 || !['ENOTEMPTY', 'EBUSY', 'ENOENT'].includes(error?.code)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+}
+
 function findHostJsons(dir) {
   if (!existsSync(dir)) return [];
   const found = [];
@@ -87,6 +99,6 @@ test('pi-sync renders one prompt/response once and does not duplicate after host
     assert.equal(countVisible(screen, 'SYNC_DUP_RESPONSE'), 1, screen.join('\n'));
   } finally {
     await mock.close();
-    rmSync(root, { recursive: true, force: true });
+    await removeRoot(root);
   }
 });

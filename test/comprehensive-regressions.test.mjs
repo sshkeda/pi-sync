@@ -205,6 +205,7 @@ test('pi-sync recovers after the sync host dies mid-turn without duplicating old
   } finally {
     await a.close();
     await b.close();
+    await waitForNoLiveHosts(laneRoot);
     await removeRoot(root);
   }
 });
@@ -259,6 +260,7 @@ test('pi-sync recovers queued peer prompts after a sync host crash', { timeout: 
   } finally {
     await a.close();
     await b.close();
+    await waitForNoLiveHosts(laneRoot);
     await removeRoot(root);
   }
 });
@@ -287,6 +289,7 @@ test('pi-sync keeps active work alive when an attached peer closes, then shuts d
   } finally {
     try { await a.close(); } catch {}
     try { await b.close(); } catch {}
+    await waitForNoLiveHosts(laneRoot);
     await removeRoot(root);
   }
 });
@@ -351,7 +354,7 @@ export default function treeNavHelper(pi) {
     branch.submit('/_tree_nav_to_text SYNC_TREE_BASE_ANSWER');
     await branch.waitForOutput('leaf_after_nav:', TIMEOUT);
     branch.submit('/sync status');
-    await branch.waitForOutput(/sync=tree-/, TIMEOUT);
+    await branch.waitForOutput(/sync=~\/2 ln_[A-Za-z0-9_-]+/, TIMEOUT);
 
     main.clearOutput();
     branch.clearOutput();
@@ -367,6 +370,7 @@ export default function treeNavHelper(pi) {
   } finally {
     await main.close();
     await branch.close();
+    await waitForNoLiveHosts(laneRoot);
     await removeRoot(root);
   }
 });
@@ -411,6 +415,7 @@ test('pi-sync queues multiple peer prompts in order with no duplicate visible bu
   } finally {
     await a.close();
     await b.close();
+    await waitForNoLiveHosts(laneRoot);
     await removeRoot(root);
   }
 });
@@ -480,6 +485,7 @@ test('pi-sync resumed real session does not duplicate transcript and remains syn
   } finally {
     await a.close();
     await b.close();
+    await waitForNoLiveHosts(laneRoot);
     await removeRoot(root);
   }
 });

@@ -171,7 +171,7 @@ test('pi-sync queues competing same-session input instead of starting a peer mod
   }
 });
 
-test('pi-sync queues competing input after peers join the same tree sync channel', { timeout: 120_000 }, async () => {
+test('pi-sync steers competing input into the active turn after peers join the same tree sync channel', { timeout: 120_000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-sync-branch-lease-'));
   const laneRoot = join(root, 'lane');
   const sessionFile = join(root, 'shared.jsonl');
@@ -235,7 +235,7 @@ export default function treeNavHelper(pi) {
     b.submit('/_tree_nav_to_text SYNC_BRANCH_QUEUE_BASE_ANSWER');
     await b.waitForOutput('leaf_after_nav:', TIMEOUT);
     b.submit('/sync status');
-    await b.waitForOutput(/sync=tree-/, TIMEOUT);
+    await b.waitForOutput(/sync=~\/2 ln_[A-Za-z0-9_-]+/, TIMEOUT);
 
     a.clearOutput();
     b.clearOutput();

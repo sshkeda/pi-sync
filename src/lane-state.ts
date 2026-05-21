@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -45,9 +45,18 @@ export type InstanceState = {
 };
 
 export const DEFAULT_LANE = "main";
+const CANONICAL_LANE_ID_RE = /^ln_[A-Za-z0-9_-]{6,}$/;
 
 export function nowIso(): string {
   return new Date().toISOString();
+}
+
+export function isCanonicalLaneId(value: string | undefined): boolean {
+  return typeof value === "string" && CANONICAL_LANE_ID_RE.test(value);
+}
+
+export function newLaneId(): string {
+  return `ln_${randomBytes(6).toString("base64url")}`;
 }
 
 export function laneRoot(): string {
@@ -163,7 +172,7 @@ export function laneAliasId(sessionKey: string, lane: string, displayId = laneDi
 
 export function writeLaneAlias(sessionKey: string, file: string, state: LaneState): LaneAliasState {
   const displayId = state.displayId ?? laneDisplayId(sessionKey, state.name);
-  const id = state.id ?? laneAliasId(sessionKey, state.name, displayId);
+  const id: string = isCanonicalLaneId(state.id) ? state.id! : newLaneId();
   const path = laneAliasPath(id);
   const existing = readJsonFile<LaneAliasState>(path);
   const alias: LaneAliasState = {
@@ -191,7 +200,7 @@ export function ensureLane(sessionKey: string, file: string, lane: string, baseL
   const path = lanePath(sessionKey, name);
   const existing = readJsonFile<LaneState>(path);
   if (existing) {
-    if (existing.id && existing.displayId && existing.aliasPath) return existing;
+    if (isCanonicalLaneId(existing.id) && existing.displayId && existing.aliasPath) return existing;
     const alias = writeLaneAlias(sessionKey, file, existing);
     const hydrated = { ...existing, id: alias.id, displayId: alias.displayId, aliasPath: laneAliasPath(alias.id) };
     writeJsonFile(path, hydrated);
@@ -199,7 +208,7 @@ export function ensureLane(sessionKey: string, file: string, lane: string, baseL
   }
 
   const displayId = laneDisplayId(sessionKey, name);
-  const id = laneAliasId(sessionKey, name, displayId);
+  const id = newLaneId();
   const created: LaneState = {
     schemaVersion: 1,
     name,
