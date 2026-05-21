@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -18,6 +18,49 @@ async function waitUntil(predicate, timeoutMs, label) {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   throw new Error(`timeout waiting for ${label}`);
+}
+
+async function removeRoot(root) {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    try {
+      rmSync(root, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      if (attempt === 9 || !['ENOTEMPTY', 'EBUSY', 'ENOENT'].includes(error?.code)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+}
+
+function findHostJsonFiles(dir) {
+  if (!existsSync(dir)) return [];
+  const found = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) found.push(...findHostJsonFiles(path));
+    else if (entry.isFile() && entry.name === 'host.json') found.push(path);
+  }
+  return found;
+}
+
+function livePid(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+async function waitForNoLiveHosts(laneRoot, timeoutMs = 10_000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const hosts = findHostJsonFiles(laneRoot)
+      .map((path) => { try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return undefined; } })
+      .filter(Boolean);
+    const live = hosts.filter((host) => livePid(host.pid));
+    if (live.length === 0) return;
+    for (const host of live) {
+      try { process.kill(host.pid, 'SIGTERM'); } catch {}
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
 }
 
 test('pi-sync does not intercept non-UI prompts', { timeout: 60_000 }, async () => {
@@ -87,7 +130,7 @@ test('pi-sync does not reset a session manager to a non-existent session file', 
 
     assert.equal(setSessionFileCalls, 0, 'must not call setSessionFile on a path Pi has not created yet');
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    await removeRoot(root);
   }
 });
 
@@ -154,7 +197,8 @@ test('pi-sync fails early in UI sessions when native replay is unavailable', { t
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
-    rmSync(root, { recursive: true, force: true });
+    await waitForNoLiveHosts(join(root, 'lane'));
+    await removeRoot(root);
   }
 });
 
@@ -232,6 +276,7 @@ test('pi-sync polling native replay marks remote events for extension guards', {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
-    rmSync(root, { recursive: true, force: true });
+    await waitForNoLiveHosts(join(root, 'lane'));
+    await removeRoot(root);
   }
 });
